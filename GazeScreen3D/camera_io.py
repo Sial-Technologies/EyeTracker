@@ -1,4 +1,4 @@
-"""USB camera capture thread. HUD fps = frames / elapsed over a 1s window; status OK/OFFLINE/RECONNECTING; backend DirectShow/MSMF."""
+"""USB camera capture thread. HUD fps = frames / elapsed over a 1s window; status OK/OFFLINE/RECONNECTING; backend MSMF on Windows."""
 
 import sys
 import threading
@@ -6,11 +6,11 @@ import time
 
 import cv2
 
+# MSMF only on Windows, no DirectShow fallback: with 3 cameras sharing one USB 2.0
+# link, DirectShow starves to ~1 fps and serves other cameras' buffers (black or
+# foreign frames). MSMF stays clean on the same hardware (see diag_multicam.py).
 CAMERA_CAPTURE_MODES = (
-    (
-        ("DirectShow", cv2.CAP_DSHOW, None),
-        ("MSMF", cv2.CAP_MSMF, None),
-    )
+    (("MSMF", cv2.CAP_MSMF, None),)
     if sys.platform == "win32"
     else (("Auto", cv2.CAP_ANY, None),)
 )
@@ -110,8 +110,15 @@ class CameraReader:
         self._thread.start()
         return True
 
+    def _clear_frame(self):
+        """Drop cached frame so read() does not return stale imagery."""
+        with self._lock:
+            self._latest_frame = None
+            self._has_frame = False
+
     def _reconnect(self):
         self.status = "RECONNECTING"
+        self._clear_frame()
         print(f"Camera {self.index}: reconnecting ({self.backend_name or 'auto'})...")
         time.sleep(RECONNECT_COOLDOWN_SEC)
         if self._stop.is_set():
@@ -125,7 +132,7 @@ class CameraReader:
     def _capture_loop(self):
         frame_count = 0
         window_start = time.perf_counter()
-        frame_interval = 1.0 / CAPTURE_TARGET_FPS
+        frame_interval = 1.0 / max(1, int(self.fps_request or CAPTURE_TARGET_FPS))
 
         while not self._stop.is_set():
             loop_start = time.perf_counter()
@@ -138,6 +145,9 @@ class CameraReader:
             ret, frame = self.cap.read()
             if not ret or frame is None:
                 self._fail_count += 1
+                # Stop serving stale frames after a short run of failures.
+                if self._fail_count > 5:
+                    self._clear_frame()
                 if self._fail_count >= RECONNECT_FAIL_THRESHOLD:
                     self._reconnect()
                 time.sleep(0.05)
@@ -156,8 +166,10 @@ class CameraReader:
                 frame_count = 0
                 window_start = now
 
+            # Copy out of OpenCV's reusable buffer so peer captures cannot overwrite us.
+            owned = frame.copy()
             with self._lock:
-                self._latest_frame = frame
+                self._latest_frame = owned
                 self._has_frame = True
 
             sleep_time = frame_interval - (time.perf_counter() - loop_start)
@@ -166,8 +178,9 @@ class CameraReader:
 
     def read(self):
         with self._lock:
-            if not self._has_frame or self._latest_frame is None:
+            if self.status != "OK" or not self._has_frame or self._latest_frame is None:
                 return False, None
+            # Already an owned copy; still copy so callers cannot mutate shared cache.
             return True, self._latest_frame.copy()
 
     def snapshot_status(self):
@@ -182,3 +195,4 @@ class CameraReader:
             self.cap.release()
             self.cap = None
         self.status = "OFFLINE"
+        self._clear_frame()

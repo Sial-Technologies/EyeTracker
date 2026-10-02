@@ -53,15 +53,24 @@ MARKER_SIZE_MIN = 90
 MARKER_SIZE_MAX = 176
 
 
-def detect_cameras(max_cams=6):
+def detect_cameras(max_cams=10, backends=None):
+    """Probe indices with the same backends CameraReader uses (DSHOW then MSMF on Windows).
+
+    Callers whose CameraReader uses a different backend list pass it as `backends`.
+    """
+    if backends is None:
+        backends = (cv2.CAP_DSHOW, cv2.CAP_MSMF) if sys.platform == "win32" else (cv2.CAP_ANY,)
+
     available = []
     for index in range(max_cams):
-        backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
-        cap = cv2.VideoCapture(index, backend)
-        if cap.isOpened():
-            available.append(index)
+        for backend in backends:
+            cap = cv2.VideoCapture(index, backend)
+            if cap.isOpened():
+                available.append(index)
+                cap.release()
+                break
             cap.release()
-        time.sleep(0.2)
+        time.sleep(0.15)
     return available
 
 

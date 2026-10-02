@@ -15,8 +15,11 @@ Usage:
 
 from __future__ import annotations
 
+import json
 import os
+import subprocess
 import sys
+import threading
 import time
 
 import cv2
@@ -24,11 +27,19 @@ import numpy as np
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(ROOT)
-for path in (ROOT, os.path.join(REPO, "ArucoScreenPose")):
-    if path not in sys.path:
-        sys.path.insert(0, path)
+_ARUCO = os.path.join(REPO, "ArucoScreenPose")
+# Prefer GazeScreen3D over ArucoScreenPose for shared names (camera_io).
+# Python already puts the script dir on sys.path; a naive insert(0) of Aruco
+# would shadow GazeScreen3D's camera_io.
+for _p in (_ARUCO, ROOT):
+    while _p in sys.path:
+        sys.path.remove(_p)
+sys.path.insert(0, _ARUCO)
+sys.path.insert(0, ROOT)
 
-from camera_io import CameraReader
+CAMERA_SETUP_PATH = os.path.join(ROOT, "camera_setup.json")
+
+from camera_io import CAMERA_CAPTURE_MODES, CameraReader
 from gaze_scale_calib import (
     GazeScaleCalib,
     draw_center_calib_target,
@@ -154,248 +165,566 @@ def _placeholder_photo(tk, width, height, rgb=(34, 34, 34)):
     return tk.PhotoImage(data=header + row * height, format="PPM")
 
 
+def _list_windows_pnp_cameras():
+    """Return [{name, device_id}, ...] from Windows PnP Camera class (stable InstanceId)."""
+    if sys.platform != "win32":
+        return []
+    cmd = (
+        "Get-PnpDevice -Class Camera -Status OK | "
+        "ForEach-Object { $_.FriendlyName + '|' + $_.InstanceId }"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", cmd],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    devices = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line or "|" not in line:
+            continue
+        name, device_id = line.split("|", 1)
+        name, device_id = name.strip(), device_id.strip()
+        if name and device_id:
+            devices.append({"name": name, "device_id": device_id})
+    return devices
+
+
+def detect_cameras_with_names(max_cams=10):
+    """Enumerate OpenCV indices paired with stable Windows device IDs.
+
+    Returns list of (index, device_id, display_name).
+    display_name looks like \"0: USB Camera\" (index suffix on duplicate names).
+    """
+    indices = sp.detect_cameras(
+        max_cams=max_cams,
+        backends=tuple(backend for _name, backend, _fourcc in CAMERA_CAPTURE_MODES),
+    )
+    if not indices:
+        return []
+
+    pnp = _list_windows_pnp_cameras()
+    name_counts = {}
+    for entry in pnp:
+        name_counts[entry["name"]] = name_counts.get(entry["name"], 0) + 1
+    name_seen = {}
+
+    cameras = []
+    for i, index in enumerate(indices):
+        if i < len(pnp):
+            name = pnp[i]["name"]
+            device_id = pnp[i]["device_id"]
+        else:
+            name = f"Camera {index}"
+            device_id = f"Camera_{index}"
+
+        if name_counts.get(name, 0) > 1:
+            seen = name_seen.get(name, 0)
+            name_seen[name] = seen + 1
+            label = f"{name} ({index})"
+        else:
+            label = name
+        display = f"{index}: {label}"
+        cameras.append((index, device_id, display))
+    return cameras
+
+
+def _load_camera_setup():
+    """Load camera_setup.json or return empty dict."""
+    try:
+        with open(CAMERA_SETUP_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
+
+
+def _save_camera_setup(setup):
+    """Persist role → {device_id, index, flip, mirror} to camera_setup.json."""
+    try:
+        with open(CAMERA_SETUP_PATH, "w", encoding="utf-8") as f:
+            json.dump(setup, f, indent=2)
+            f.write("\n")
+    except OSError as exc:
+        print(f"Could not save camera setup: {exc}")
+
+
+def _index_for_device_id(cameras_info, device_id):
+    """Find current OpenCV index for a saved device_id, or None."""
+    if not device_id:
+        return None
+    for index, did, _display in cameras_info:
+        if did == device_id:
+            return index
+    return None
+
+
+def _display_for_index(cameras_info, index):
+    for idx, _did, display in cameras_info:
+        if idx == index:
+            return display
+    return None
+
+
+def _device_id_for_index(cameras_info, index):
+    for idx, did, _display in cameras_info:
+        if idx == index:
+            return did
+    return f"Camera_{index}"
+
+
+def _parse_camera_selection(value):
+    """Parse combobox value → OpenCV index, or None for 'None'/empty."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text == "None":
+        return None
+    # "2: USB Camera" or bare "2"
+    head = text.split(":", 1)[0].strip()
+    try:
+        return int(head)
+    except ValueError:
+        return None
+
+
 def selection_gui():
+    """Role-first picker: Left / Right / Front panels, each with dropdown + live preview."""
     import tkinter as tk
     from tkinter import ttk
 
-    cameras = sp.detect_cameras()
+    state = {
+        "cameras_info": detect_cameras_with_names(),
+        "role_device": {"left": None, "right": None, "front": None},
+    }
+    saved = _load_camera_setup()
+
+    def cam_displays(optional=False):
+        labels = [display for _idx, _did, display in state["cameras_info"]]
+        # Always include None so a missing rematch can show unbound without stealing.
+        return ["None"] + labels
+
+    def resolve_saved_role(role_key, optional=False):
+        """Match saved device_id to current index; fall back to saved index; else default."""
+        entry = saved.get(role_key)
+        info = state["cameras_info"]
+        if entry and isinstance(entry, dict):
+            device_id = entry.get("device_id")
+            index = _index_for_device_id(info, device_id)
+            if index is None and entry.get("index") is not None:
+                # Device missing from PnP map — try last known index if still present.
+                want = int(entry["index"])
+                if any(idx == want for idx, _d, _n in info):
+                    index = want
+            if index is not None:
+                state["role_device"][role_key] = _device_id_for_index(info, index)
+                return _display_for_index(info, index), entry
+            # Saved device not present — leave unbound (do not steal another index).
+            state["role_device"][role_key] = device_id
+            return "None", entry
+
+        # No save: sensible defaults
+        displays = [d for d in cam_displays() if d != "None"]
+        if role_key == "right":
+            return "None", None
+        if role_key == "front" and len(displays) > 1:
+            return displays[1], None
+        return (displays[0] if displays else "None"), None
+
+    left_display, left_saved = resolve_saved_role("left")
+    right_display, right_saved = resolve_saved_role("right", optional=True)
+    front_display, front_saved = resolve_saved_role("front")
+
     root = tk.Tk()
-    root.title("GazeScreen3D")
-    # Room for 3× ~420px previews side by side.
-    root.minsize(980, 620)
-    root.geometry("1280x760")
+    root.title("GazeScreen3D — camera setup")
+    root.minsize(1100, 640)
+    root.geometry("1280x720")
+
     tk.Label(
         root,
-        text="IR eye + front camera → gaze on screen (ArUco plane)",
+        text="Pick a camera for each role. Device IDs persist across sessions and index changes.",
         font=("Arial", 12, "bold"),
-    ).pack(pady=8)
+    ).pack(pady=(10, 2))
 
-    def labels():
-        return [str(c) for c in cameras] if cameras else ["0"]
+    status_row = ttk.Frame(root)
+    status_row.pack(pady=(0, 6), fill="x", padx=10)
+    status_lbl = tk.Label(
+        status_row,
+        text="",
+        font=("Arial", 9),
+        fg="#555",
+        anchor="w",
+        justify="left",
+    )
+    status_lbl.pack(side="left", fill="x", expand=True)
+    refresh_btn = ttk.Button(status_row, text="Refresh camera list")
+    refresh_btn.pack(side="right", padx=(8, 0))
 
-    left_var = tk.StringVar(value=labels()[0])
-    right_var = tk.StringVar(value="None")
-    front_var = tk.StringVar(value=labels()[1] if len(cameras) > 1 else labels()[0])
-    flip_left = tk.BooleanVar(value=True)
-    flip_right = tk.BooleanVar(value=False)
-    mirror_left = tk.BooleanVar(value=False)
-    mirror_right = tk.BooleanVar(value=True)
-    flip_front = tk.BooleanVar(value=False)
-    mirror_front = tk.BooleanVar(value=False)
+    left_var = tk.StringVar(value=left_display)
+    right_var = tk.StringVar(value=right_display)
+    front_var = tk.StringVar(value=front_display)
+    flip_left = tk.BooleanVar(value=True if left_saved is None else bool(left_saved.get("flip", True)))
+    flip_right = tk.BooleanVar(
+        value=False if right_saved is None else bool(right_saved.get("flip", False))
+    )
+    mirror_left = tk.BooleanVar(
+        value=False if left_saved is None else bool(left_saved.get("mirror", False))
+    )
+    mirror_right = tk.BooleanVar(
+        value=True if right_saved is None else bool(right_saved.get("mirror", True))
+    )
+    flip_front = tk.BooleanVar(
+        value=False if front_saved is None else bool(front_saved.get("flip", False))
+    )
+    mirror_front = tk.BooleanVar(
+        value=False if front_saved is None else bool(front_saved.get("mirror", False))
+    )
 
-    frame = ttk.Frame(root)
-    frame.pack(pady=4)
+    PREVIEW_W, PREVIEW_H = 380, 285
+    role_vars = {"left": left_var, "right": right_var, "front": front_var}
+    ROLE_META = (
+        ("left", "Left IR (required)", left_var, False, "#2e7d32", flip_left, mirror_left, True),
+        ("right", "Right IR (optional)", right_var, True, "#1565c0", flip_right, mirror_right, False),
+        ("front", "Front camera (required)", front_var, False, "#e65100", flip_front, mirror_front, False),
+    )
 
-    def row(r, text, var, values):
-        tk.Label(frame, text=text).grid(row=r, column=0, sticky="w", padx=6, pady=3)
-        box = ttk.Combobox(frame, textvariable=var, values=values, width=10, state="readonly")
-        box.grid(row=r, column=1, padx=6, pady=3)
-
-    row(0, "Left IR:", left_var, labels())
-    row(1, "Right IR:", right_var, ["None"] + labels())
-    row(2, "Front camera:", front_var, labels())
-
-    # Live thumbnails so indices map to a real image before Start.
-    preview_wrap = ttk.LabelFrame(root, text="Camera previews (L / R / Front under each feed)")
-    preview_wrap.pack(padx=10, pady=8, fill="both", expand=True)
-    status_lbl = tk.Label(preview_wrap, text="Opening cameras…", font=("Arial", 9), fg="#555")
-    status_lbl.pack(pady=(4, 2))
-    thumbs = ttk.Frame(preview_wrap)
-    thumbs.pack(padx=6, pady=6, fill="both", expand=True)
-
-    preview_readers = {}
-    thumb_widgets = {}  # index -> {label, role_lbl, border, photo}
-
-    # Large enough to tell IR eye vs webcam apart at a glance.
-    PREVIEW_W, PREVIEW_H = 420, 315
-    ROLE_COLORS = {
-        "left": "#2e7d32",
-        "right": "#1565c0",
-        "front": "#e65100",
-        None: "#888888",
-    }
-
-    def role_for_index(idx):
-        roles = []
-        if left_var.get() == str(idx):
-            roles.append("Left IR")
-        if right_var.get() == str(idx):
-            roles.append("Right IR")
-        if front_var.get() == str(idx):
-            roles.append("Front")
-        return ", ".join(roles) if roles else "—"
-
-    def primary_role(idx):
-        if left_var.get() == str(idx):
-            return "left"
-        if right_var.get() == str(idx):
-            return "right"
-        if front_var.get() == str(idx):
-            return "front"
-        return None
-
-    def refresh_role_labels(*_args):
-        for idx, w in thumb_widgets.items():
-            w["role_lbl"].config(text=role_for_index(idx), fg=ROLE_COLORS[primary_role(idx)])
-            color = ROLE_COLORS[primary_role(idx)]
-            w["border"].config(highlightbackground=color, highlightcolor=color)
-
-    def _alt_cam(exclude, also_exclude=None):
-        skip = {str(exclude)}
-        if also_exclude is not None and also_exclude != "None":
-            skip.add(str(also_exclude))
-        for c in cameras:
-            if str(c) not in skip:
-                return str(c)
-        return None
-
-    def assign(idx, role):
-        s = str(idx)
-        if role != "left" and left_var.get() == s:
-            alt = _alt_cam(idx)
-            if alt is None:
-                return
-            left_var.set(alt)
-        if role != "right" and right_var.get() == s:
-            right_var.set("None")
-        if role != "front" and front_var.get() == s:
-            alt = _alt_cam(idx, left_var.get() if role == "left" else None)
-            if alt is None:
-                return
-            front_var.set(alt)
-        if role == "left":
-            left_var.set(s)
-        elif role == "right":
-            right_var.set(s)
-        else:
-            front_var.set(s)
+    # Role owns its reader — panel never shares capture by OpenCV index.
+    readers = {"left": None, "right": None, "front": None}
+    panels = {}
+    comboboxes = {}
+    # Camera open/stop is slow on Windows; never block the Tk thread.
+    _cam_lock = threading.Lock()
+    _open_gen = {"left": 0, "right": 0, "front": 0}
 
     def stop_previews():
-        if not preview_readers:
-            return
-        for reader in preview_readers.values():
-            reader.stop()
-        preview_readers.clear()
-        # Give Windows time to release exclusive USB handles before main open.
-        time.sleep(0.4)
+        for role in list(readers):
+            _open_gen[role] += 1  # cancel any in-flight open
+            reader = readers.get(role)
+            readers[role] = None
+            if reader is not None:
+                reader.stop()
+        time.sleep(0.2)
 
-    def update_thumbs():
+    def role_using_index(index, exclude_role=None):
+        for role, var in role_vars.items():
+            if role == exclude_role:
+                continue
+            if _parse_camera_selection(var.get()) == index:
+                return role
+        return None
+
+    def sync_role_reader(role):
+        """Match this role's CameraReader to its dropdown without freezing the UI."""
+        index = _parse_camera_selection(role_vars[role].get())
+        current = readers.get(role)
+
+        if index is not None:
+            other = role_using_index(index, exclude_role=role)
+            if other is not None:
+                status_lbl.config(
+                    text=f"Index {index} already used by {other}. Pick a different camera."
+                )
+                if current is not None:
+                    display = _display_for_index(state["cameras_info"], current.index)
+                    if display:
+                        role_vars[role].set(display)
+                else:
+                    role_vars[role].set("None")
+                return
+            if current is not None and current.index == index:
+                state["role_device"][role] = _device_id_for_index(state["cameras_info"], index)
+                return
+
+        _open_gen[role] += 1
+        gen = _open_gen[role]
+        old = readers.get(role)
+        readers[role] = None  # preview shows "opening…" immediately
+        if index is None:
+            state["role_device"][role] = None
+        else:
+            state["role_device"][role] = _device_id_for_index(state["cameras_info"], index)
+            status_lbl.config(text=f"Opening camera {index} for {role}…")
+
+        def worker():
+            with _cam_lock:
+                if old is not None:
+                    old.stop()
+                    time.sleep(0.25)
+                if _open_gen[role] != gen:
+                    return
+                if index is None:
+                    return
+                reader = CameraReader(index, width=640, height=480)
+                reader.start()
+
+            def apply():
+                if not root.winfo_exists() or _open_gen[role] != gen:
+                    reader.stop()
+                    return
+                readers[role] = reader
+                status_lbl.config(
+                    text=f"{role} ready: {_display_for_index(state['cameras_info'], index) or index}"
+                )
+
+            try:
+                root.after(0, apply)
+            except tk.TclError:
+                reader.stop()
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_selection_change(role):
+        def _handler(*_args):
+            sync_role_reader(role)
+
+        return _handler
+
+    def apply_camera_list_to_ui(status_prefix=None):
+        """Refresh combobox values; rematch each role by saved device_id."""
+        displays = cam_displays()
+        for role, _title, var, optional, *_rest in ROLE_META:
+            values = cam_displays(optional=optional)
+            box = comboboxes.get(role)
+            if box is not None:
+                box["values"] = values
+
+            device_id = state["role_device"].get(role)
+            new_index = _index_for_device_id(state["cameras_info"], device_id) if device_id else None
+            if new_index is not None:
+                display = _display_for_index(state["cameras_info"], new_index)
+                if display and var.get() != display:
+                    var.set(display)
+            else:
+                # Device gone: clear optional roles; keep required showing None until user picks.
+                current_idx = _parse_camera_selection(var.get())
+                still_there = current_idx is not None and any(
+                    idx == current_idx for idx, _d, _n in state["cameras_info"]
+                )
+                if not still_there:
+                    var.set("None")
+                    _open_gen[role] += 1
+                    old = readers.get(role)
+                    readers[role] = None
+                    if old is not None:
+                        threading.Thread(target=old.stop, daemon=True).start()
+
+        bits = []
+        for role in ("left", "right", "front"):
+            idx = _parse_camera_selection(role_vars[role].get())
+            did = state["role_device"].get(role)
+            short = {"left": "L", "right": "R", "front": "F"}[role]
+            if idx is None:
+                bits.append(f"{short}=—")
+            else:
+                name = _display_for_index(state["cameras_info"], idx) or str(idx)
+                bits.append(f"{short}={name}")
+        n = len(state["cameras_info"])
+        prefix = (status_prefix + "  |  ") if status_prefix else ""
+        status_lbl.config(text=f"{prefix}Detected {n}  |  {', '.join(bits)}")
+
+    roles_row = ttk.Frame(root)
+    roles_row.pack(padx=10, pady=4, fill="both", expand=True)
+
+    placeholder = _placeholder_photo(tk, PREVIEW_W, PREVIEW_H)
+
+    for col, (role, title, var, optional, color, flip_var, mirror_var, flip_default_hint) in enumerate(
+        ROLE_META
+    ):
+        cell = ttk.LabelFrame(roles_row, text=title)
+        cell.grid(row=0, column=col, padx=8, pady=4, sticky="nsew")
+        roles_row.columnconfigure(col, weight=1)
+
+        pick = ttk.Frame(cell)
+        pick.pack(pady=(8, 4))
+        tk.Label(pick, text="Camera:", font=("Arial", 10)).pack(side="left", padx=(0, 6))
+        box = ttk.Combobox(
+            pick,
+            textvariable=var,
+            values=cam_displays(optional=optional),
+            width=28,
+            state="readonly",
+        )
+        box.pack(side="left")
+        comboboxes[role] = box
+
+        border = tk.Frame(cell, highlightthickness=4, highlightbackground=color)
+        border.pack(padx=8, pady=4)
+        img_lbl = tk.Label(
+            border,
+            image=placeholder,
+            text="Select a camera",
+            compound="center",
+            bg="#222",
+            fg="#ccc",
+            font=("Arial", 13, "bold"),
+        )
+        img_lbl.pack()
+
+        hint = "Flip = upside-down mount" if flip_default_hint else "Flip / mirror if image looks wrong"
+        checks = ttk.Frame(cell)
+        checks.pack(pady=6)
+        ttk.Checkbutton(checks, text="Flip", variable=flip_var).pack(side="left", padx=4)
+        ttk.Checkbutton(checks, text="Mirror", variable=mirror_var).pack(side="left", padx=4)
+        tk.Label(cell, text=hint, font=("Arial", 8), fg="#666").pack(pady=(0, 6))
+
+        panels[role] = {
+            "var": var,
+            "label": img_lbl,
+            "photo": placeholder,
+            "color": color,
+            "flip": flip_var,
+            "mirror": mirror_var,
+        }
+        var.trace_add("write", on_selection_change(role))
+
+    def update_previews():
         if not root.winfo_exists():
             return
-        alive = 0
-        for idx, reader in list(preview_readers.items()):
-            ret, frame = reader.read()
-            w = thumb_widgets.get(idx)
-            if not w:
+        live = 0
+        bits = []
+        for role, _title, var, *_rest in ROLE_META:
+            panel = panels[role]
+            idx = _parse_camera_selection(var.get())
+            short = {"left": "L", "right": "R", "front": "F"}[role]
+            reader = readers.get(role)
+            if idx is None:
+                panel["label"].config(image=placeholder, text="None\n(optional)")
+                panel["photo"] = placeholder
+                bits.append(f"{short}=—")
                 continue
+            bits.append(f"{short}={idx}")
+            if reader is None:
+                panel["label"].config(image=placeholder, text=f"Cam {idx}\nopening…")
+                panel["photo"] = placeholder
+                continue
+            # Guard: role reader must match selected index (strong link).
+            if reader.index != idx:
+                panel["label"].config(image=placeholder, text=f"Cam {idx}\nsyncing…")
+                panel["photo"] = placeholder
+                continue
+            ret, frame = reader.read()
             if ret and frame is not None:
-                alive += 1
+                live += 1
+                # Live flip/mirror preview (same semantics as run()).
+                if panel["flip"].get():
+                    frame = cv2.flip(frame, 0)
+                if panel["mirror"].get():
+                    frame = cv2.flip(frame, 1)
                 try:
                     photo = _bgr_to_photoimage(tk, frame, PREVIEW_W, PREVIEW_H)
-                    w["label"].config(image=photo, text="")
-                    w["photo"] = photo  # keep ref
+                    panel["label"].config(image=photo, text="")
+                    panel["photo"] = photo
                 except tk.TclError:
                     return
-            elif w["photo"] is None:
-                w["label"].config(text=f"Cam {idx}\n(no signal)")
-        if preview_readers:
+            else:
+                status = reader.status if reader else "OFFLINE"
+                panel["label"].config(
+                    image=placeholder,
+                    text=f"Cam {idx}\n({status})",
+                )
+                panel["photo"] = placeholder
+        n = len(state["cameras_info"])
+        opened = sum(1 for r in readers.values() if r is not None)
+        # Don't overwrite an in-progress "Opening…" status every tick.
+        current = status_lbl.cget("text")
+        if not current.startswith("Opening"):
             status_lbl.config(
-                text=f"Live: {alive}/{len(preview_readers)} — use L / R / Front under each feed"
+                text=f"Detected {n}  |  {', '.join(bits)}  |  live {live}/{opened}"
             )
-        root.after(66, update_thumbs)
+        root.after(66, update_previews)
 
-    def build_thumbs():
-        placeholder = _placeholder_photo(tk, PREVIEW_W, PREVIEW_H)
-        for col, idx in enumerate(cameras):
-            cell = ttk.Frame(thumbs)
-            cell.grid(row=0, column=col, padx=10, pady=4, sticky="n")
+    def refresh_cameras():
+        status_lbl.config(text="Refreshing camera list…")
+        root.update_idletasks()
+        # Release exclusive handles so re-probe can see every device.
+        stop_previews()
+        state["cameras_info"] = detect_cameras_with_names()
+        # Rematch roles by device_id (indices may have shifted).
+        messages = []
+        for role in ("left", "right", "front"):
+            device_id = state["role_device"].get(role)
+            if not device_id:
+                continue
+            new_idx = _index_for_device_id(state["cameras_info"], device_id)
+            if new_idx is None:
+                messages.append(f"{role} offline")
+            else:
+                old_display = role_vars[role].get()
+                new_display = _display_for_index(state["cameras_info"], new_idx)
+                if new_display and new_display != old_display:
+                    messages.append(f"{role}→{new_display}")
+        apply_camera_list_to_ui(
+            status_prefix=("Remapped: " + ", ".join(messages)) if messages else "Camera list refreshed"
+        )
+        for role in ("left", "right", "front"):
+            sync_role_reader(role)
 
-            border = tk.Frame(cell, highlightthickness=4, highlightbackground=ROLE_COLORS[None])
-            border.pack()
-            # Do NOT set width/height in characters: with an image those become pixels
-            # and crush the preview to a tiny strip (what happened before).
-            img_lbl = tk.Label(
-                border,
-                image=placeholder,
-                text=f"Cam {idx}\nopening…",
-                compound="center",
-                bg="#222",
-                fg="#ccc",
-                font=("Arial", 14, "bold"),
-            )
-            img_lbl.pack()
-
-            tk.Label(cell, text=f"Index {idx}", font=("Arial", 12, "bold")).pack(pady=(6, 0))
-            role_lbl = tk.Label(cell, text="—", font=("Arial", 11), fg=ROLE_COLORS[None])
-            role_lbl.pack()
-
-            btns = ttk.Frame(cell)
-            btns.pack(pady=6)
-            ttk.Button(btns, text="L", width=4, command=lambda i=idx: assign(i, "left")).pack(
-                side="left", padx=3
-            )
-            ttk.Button(btns, text="R", width=4, command=lambda i=idx: assign(i, "right")).pack(
-                side="left", padx=3
-            )
-            ttk.Button(btns, text="Front", width=7, command=lambda i=idx: assign(i, "front")).pack(
-                side="left", padx=3
-            )
-
-            thumb_widgets[idx] = {
-                "label": img_lbl,
-                "role_lbl": role_lbl,
-                "border": border,
-                "photo": placeholder,
-            }
-
-            reader = CameraReader(idx, width=640, height=480)
-            reader.start()
-            preview_readers[idx] = reader
-
-        if not cameras:
-            status_lbl.config(text="No cameras detected")
-        else:
-            refresh_role_labels()
-            root.after(100, update_thumbs)
-
-    for var in (left_var, right_var, front_var):
-        var.trace_add("write", refresh_role_labels)
-
-    # Open previews after the window is mapped (keeps UI responsive).
-    root.after(50, build_thumbs)
-
-    checks = ttk.Frame(root)
-    checks.pack(pady=4)
-    ttk.Checkbutton(checks, text="Flip L (upside-down mount)", variable=flip_left).pack(side="left", padx=4)
-    ttk.Checkbutton(checks, text="Mirror L", variable=mirror_left).pack(side="left", padx=4)
-    ttk.Checkbutton(checks, text="Flip R", variable=flip_right).pack(side="left", padx=4)
-    ttk.Checkbutton(checks, text="Mirror R", variable=mirror_right).pack(side="left", padx=4)
-    ttk.Checkbutton(checks, text="Flip front", variable=flip_front).pack(side="left", padx=4)
-    ttk.Checkbutton(checks, text="Mirror front", variable=mirror_front).pack(side="left", padx=4)
+    refresh_btn.config(command=refresh_cameras)
 
     tk.Label(
         root,
-        text="C = screen center | click IR preview = lock eye center | U unlock | Q quit\n"
-        "Flip L = left IR mounted upside-down (corrects image before gaze math).",
+        text="Tip: cycle each dropdown until the preview matches that role "
+        "(eye close-up vs monitor/room). Refresh remaps saved devices if indexes shifted.\n"
+        "After Start: C = screen center calib | click IR = lock eye center | U unlock | Q quit",
         font=("Arial", 9),
+        justify="center",
     ).pack(pady=6)
 
     choice = {}
 
-    def parse(v):
-        return None if v == "None" else int(v)
-
     def start():
-        stop_previews()
-        choice["left"] = parse(left_var.get())
-        choice["right"] = parse(right_var.get())
-        choice["front"] = parse(front_var.get())
+        left_i = _parse_camera_selection(left_var.get())
+        right_i = _parse_camera_selection(right_var.get())
+        front_i = _parse_camera_selection(front_var.get())
+        if left_i is None and right_i is None:
+            status_lbl.config(text="Need at least one IR eye camera (Left or Right).")
+            return
+        if front_i is None:
+            status_lbl.config(text="Need a Front camera.")
+            return
+        assigned = [i for i in (left_i, right_i, front_i) if i is not None]
+        if len(assigned) != len(set(assigned)):
+            status_lbl.config(text="Each role needs a different camera.")
+            return
+        status_lbl.config(text="Starting… keeping open cameras (no reopen).")
+        root.update_idletasks()
+
+        setup = {}
+        for role, index in (("left", left_i), ("right", right_i), ("front", front_i)):
+            if index is None:
+                setup[role] = None
+                continue
+            flip_map = {"left": flip_left, "right": flip_right, "front": flip_front}
+            mirror_map = {"left": mirror_left, "right": mirror_right, "front": mirror_front}
+            setup[role] = {
+                "device_id": state["role_device"].get(role) or _device_id_for_index(state["cameras_info"], index),
+                "index": index,
+                "flip": bool(flip_map[role].get()),
+                "mirror": bool(mirror_map[role].get()),
+            }
+        _save_camera_setup(setup)
+
+        choice["left"] = left_i
+        choice["right"] = right_i
+        choice["front"] = front_i
         choice["flip_left"] = flip_left.get()
         choice["flip_right"] = flip_right.get()
         choice["mirror_left"] = mirror_left.get()
         choice["mirror_right"] = mirror_right.get()
         choice["flip_front"] = flip_front.get()
         choice["mirror_front"] = mirror_front.get()
+        # Handoff as index → reader (run() expects that shape).
+        handed = {}
+        for role, reader in readers.items():
+            if reader is not None:
+                handed[reader.index] = reader
+            readers[role] = None
+        choice["readers"] = handed
         root.destroy()
 
     def on_close():
@@ -403,7 +732,15 @@ def selection_gui():
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", on_close)
-    tk.Button(root, text="Start", command=start).pack(pady=10)
+    tk.Button(root, text="Start", font=("Arial", 11, "bold"), command=start).pack(pady=10)
+
+    def bootstrap():
+        apply_camera_list_to_ui(status_prefix="Loaded saved camera setup" if saved else None)
+        for role in ("left", "right", "front"):
+            sync_role_reader(role)
+        update_previews()
+
+    root.after(50, bootstrap)
     root.mainloop()
     stop_previews()
     return choice
@@ -559,19 +896,39 @@ def run(choice):
     eye_tracker.calibrated = False
     eye_tracker.reset_gaze_smoothing()
 
+    pre_readers = choice.pop("readers", None) or {}
+    by_index = {}
+
+    def take_reader(index, label):
+        if index in by_index:
+            return by_index[index]
+        reader = pre_readers.pop(index, None)
+        if reader is None:
+            print(f"Opening {label} camera {index}…")
+            reader = CameraReader(index, width=640, height=480)
+            reader.start()
+            print(f"{label} {index}: {reader.backend_name or 'opening…'}")
+        else:
+            if not reader.is_opened():
+                print(f"Reopening {label} camera {index} (preview handle was offline)…")
+                reader._open_capture()
+                reader.start()
+            print(f"{label} {index}: {reader.backend_name or '?'} (from setup)")
+        by_index[index] = reader
+        return reader
+
     readers = {}
     for eye_id, index in (("left", left_index), ("right", right_index)):
         if index is None:
             continue
-        reader = CameraReader(index, width=640, height=480)
-        reader.start()
-        print(f"{eye_id} IR {index}: {reader.backend_name or 'opening…'}")
-        readers[eye_id] = reader
+        readers[eye_id] = take_reader(index, f"{eye_id} IR")
         eye_tracker.reset_eye_tracking_state(eye_id)
 
-    front_reader = CameraReader(front_index, width=640, height=480)
-    front_reader.start()
-    print(f"Front {front_index}: {front_reader.backend_name or 'opening…'}")
+    front_reader = take_reader(front_index, "Front")
+
+    for leftover in pre_readers.values():
+        leftover.stop()
+    pre_readers.clear()
 
     layout_state = {"show_previews": True, "eyes": {}}
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
@@ -843,9 +1200,12 @@ def run(choice):
                             f"keep looking at the {edge} cross..."
                         )
     finally:
-        for reader in readers.values():
+        stopped = set()
+        for reader in list(readers.values()) + [front_reader]:
+            if id(reader) in stopped:
+                continue
             reader.stop()
-        front_reader.stop()
+            stopped.add(id(reader))
         cv2.destroyAllWindows()
 
 

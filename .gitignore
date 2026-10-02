@@ -1,3 +1,5 @@
 .venv/
 __pycache__/
 *.pyc
+GazeScreen3D/diag_out/
+GazeScreen3D/camera_setup.json
