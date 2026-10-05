@@ -5,6 +5,25 @@ This repository is an open-source 3D eye tracking algorithm written in Python. C
 
 To use the script, run "python .\OrloskyPupilDetector.py" from your shell. If the hardcoded file path in the select_video() function does not find a video at the specified path, it will open a browse window that allows you to select a video. The process_video() function handles the majority of the processing and can be easily modified to work with a camera capture or image. It returns a rotated_rect that represents the pupil ellipse. A lite version is also included that is more efficient, but less robust. Be sure to have an adequate light source for the lite version. 
 
+## GazeScreen3D - Real-time Eye Tracking with Screen Gaze
+
+The `GazeScreen3D` folder contains a full eye tracking application with ArUco marker-based screen pose tracking and gaze projection.
+
+### Running GazeScreen3D
+```bash
+cd GazeScreen3D
+python GazeScreen3D.py
+```
+
+### Recording Feature
+GazeScreen3D now includes built-in video recording:
+- Press **R** to record 3 separate 15-second clips in MP4 format
+- Automatic sequential recording with visual feedback
+- Clips saved to `GazeScreen3D/recordings/` folder
+- See `GazeScreen3D/RECORDING.md` for detailed usage instructions
+
+## Test Video
+
 A test video (eye_test.mp4) is included in the root directory for testing. Algorithm details are explained here: https://www.youtube.com/watch?v=bL92JUBG8xw
 
 When running the script on this test video, your results should look like this: https://youtu.be/B06cUMplDHw.  
