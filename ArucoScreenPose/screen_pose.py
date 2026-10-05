@@ -539,7 +539,8 @@ class ScreenPoseTracker:
             return out
 
         cv2.aruco.drawDetectedMarkers(out, corners, ids)
-        flat_ids = [int(i[0]) for i in ids]
+        # ArucoDetector may return ids as (N, 1) or (N,); reshape so both work.
+        flat_ids = [int(x) for x in np.asarray(ids).reshape(-1)]
         self.corner_ids_found = {mid for mid in flat_ids if mid in CORNER_MARKER_IDS}
 
         object_pts = []

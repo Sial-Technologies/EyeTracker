@@ -241,13 +241,75 @@ def _load_camera_setup():
 
 
 def _save_camera_setup(setup):
-    """Persist role → {device_id, index, flip, mirror} to camera_setup.json."""
+    """Persist role → {device_id, index, flip, mirror, view} to camera_setup.json."""
     try:
         with open(CAMERA_SETUP_PATH, "w", encoding="utf-8") as f:
             json.dump(setup, f, indent=2)
             f.write("\n")
     except OSError as exc:
         print(f"Could not save camera setup: {exc}")
+
+
+def _normalize_preview_view(view):
+    """Clamp/coerce a zoom/pan dict to the runtime shape."""
+    if not isinstance(view, dict):
+        return {"zoom": 1.0, "pan_x": 0, "pan_y": 0}
+    try:
+        zoom = float(view.get("zoom", 1.0))
+    except (TypeError, ValueError):
+        zoom = 1.0
+    try:
+        pan_x = int(round(float(view.get("pan_x", 0))))
+    except (TypeError, ValueError):
+        pan_x = 0
+    try:
+        pan_y = int(round(float(view.get("pan_y", 0))))
+    except (TypeError, ValueError):
+        pan_y = 0
+    return {
+        "zoom": max(0.5, min(5.0, round(zoom, 1))),
+        "pan_x": pan_x,
+        "pan_y": pan_y,
+    }
+
+
+def preview_views_from_setup(saved):
+    """Build per-role preview zoom/pan from camera_setup.json (or defaults)."""
+    views = {role: {"zoom": 1.0, "pan_x": 0, "pan_y": 0} for role in ("left", "right", "front")}
+    if not isinstance(saved, dict):
+        return views
+    for role in views:
+        entry = saved.get(role)
+        if isinstance(entry, dict) and isinstance(entry.get("view"), dict):
+            views[role] = _normalize_preview_view(entry["view"])
+    return views
+
+
+def _view_dict_for_save(preview_views, role):
+    v = preview_views.get(role) if isinstance(preview_views, dict) else None
+    return _normalize_preview_view(v)
+
+
+def zoom_affects_tracking_from_setup(saved):
+    """Per-role flag: when True, zoom/pan is applied before eye tracking."""
+    flags = {role: False for role in ("left", "right", "front")}
+    if not isinstance(saved, dict):
+        return flags
+    for role in flags:
+        entry = saved.get(role)
+        if isinstance(entry, dict):
+            flags[role] = bool(entry.get("zoom_affects_tracking", False))
+    return flags
+
+
+def zoom_affects_tracking_for(choice, role):
+    """Resolve zoom_affects_tracking for a role from run() choice dict."""
+    if not isinstance(choice, dict):
+        return False
+    flags = choice.get("zoom_affects_tracking")
+    if isinstance(flags, dict):
+        return bool(flags.get(role, False))
+    return bool(choice.get(f"zoom_affects_tracking_{role}", False))
 
 
 def _index_for_device_id(cameras_info, device_id):
@@ -382,6 +444,10 @@ def selection_gui():
     mirror_front = tk.BooleanVar(
         value=False if front_saved is None else bool(front_saved.get("mirror", False))
     )
+    saved_zoom_flags = zoom_affects_tracking_from_setup(saved)
+    zoom_track_left = tk.BooleanVar(value=saved_zoom_flags["left"])
+    zoom_track_right = tk.BooleanVar(value=saved_zoom_flags["right"])
+    zoom_track_vars = {"left": zoom_track_left, "right": zoom_track_right}
 
     PREVIEW_W, PREVIEW_H = 380, 285
     role_vars = {"left": left_var, "right": right_var, "front": front_var}
@@ -574,6 +640,13 @@ def selection_gui():
         checks.pack(pady=6)
         ttk.Checkbutton(checks, text="Flip", variable=flip_var).pack(side="left", padx=4)
         ttk.Checkbutton(checks, text="Mirror", variable=mirror_var).pack(side="left", padx=4)
+        if role in zoom_track_vars:
+            ttk.Checkbutton(
+                checks,
+                text="Zoom→track",
+                variable=zoom_track_vars[role],
+            ).pack(side="left", padx=4)
+            hint = f"{hint} | Zoom→track = zoom before pupil tracking"
         tk.Label(cell, text=hint, font=("Arial", 8), fg="#666").pack(pady=(0, 6))
 
         panels[role] = {
@@ -586,7 +659,7 @@ def selection_gui():
         }
         var.trace_add("write", on_selection_change(role))
 
-    setup_preview_views = default_preview_views()
+    setup_preview_views = preview_views_from_setup(saved)
 
     def update_previews():
         if not root.winfo_exists():
@@ -715,6 +788,10 @@ def selection_gui():
                 "index": index,
                 "flip": bool(flip_map[role].get()),
                 "mirror": bool(mirror_map[role].get()),
+                "view": _view_dict_for_save(setup_preview_views, role),
+                "zoom_affects_tracking": bool(
+                    zoom_track_vars[role].get() if role in zoom_track_vars else False
+                ),
             }
         _save_camera_setup(setup)
 
@@ -728,6 +805,15 @@ def selection_gui():
         choice["mirror_right"] = mirror_right.get()
         choice["flip_front"] = flip_front.get()
         choice["mirror_front"] = mirror_front.get()
+        choice["preview_views"] = {
+            role: _normalize_preview_view(setup_preview_views.get(role))
+            for role in ("left", "right", "front")
+        }
+        choice["zoom_affects_tracking"] = {
+            "left": bool(zoom_track_left.get()),
+            "right": bool(zoom_track_right.get()),
+            "front": False,
+        }
         choice["device_ids"] = {
             role: _stable_device_id(entry["device_id"]) if entry else None
             for role, entry in setup.items()
@@ -1131,18 +1217,51 @@ def make_mouse_handler(layout_state):
             x0, y0, w, h = slot["rect"]
             if not (x0 <= x < x0 + w and y0 <= y < y0 + h):
                 continue
-            ox, oy, nw, nh = slot["fit"]
-            src_w, src_h = slot["src_size"]
-            local_x = x - x0 - ox
-            local_y = y - y0 - oy
-            if not (0 <= local_x < nw and 0 <= local_y < nh):
+            mapped = map_zoomed_panel_click_to_frame(
+                x - x0,
+                y - y0,
+                w,
+                h,
+                slot["fit"],
+                slot["src_size"],
+                slot.get("view"),
+                zoom_affects_tracking=bool(slot.get("zoom_affects_tracking", False)),
+            )
+            if mapped is None:
                 return
-            frame_x = int(local_x * src_w / nw)
-            frame_y = int(local_y * src_h / nh)
-            lock_eye_sphere_center(eye_id, frame_x, frame_y)
+            lock_eye_sphere_center(eye_id, mapped[0], mapped[1])
             return
 
     return on_mouse
+
+
+def map_zoomed_panel_click_to_frame(
+    local_x, local_y, panel_w, panel_h, fit, src_size, view=None, zoom_affects_tracking=False
+):
+    """Map letterboxed panel coords → source frame pixels.
+
+    When zoom_affects_tracking is False (default), invert display zoom/pan first.
+    When True, tracking already ran on the zoomed frame so clicks map directly.
+    """
+    ox, oy, nw, nh = fit
+    src_w, src_h = src_size
+    x = float(local_x)
+    y = float(local_y)
+    # Only invert display zoom when it was applied after tracking (display-only mode).
+    if view and not zoom_affects_tracking:
+        zoom = float(view.get("zoom", 1.0)) or 1.0
+        pan_x = float(view.get("pan_x", 0))
+        pan_y = float(view.get("pan_y", 0))
+        cx, cy = panel_w / 2.0, panel_h / 2.0
+        x = (x - cx - pan_x) / zoom + cx
+        y = (y - cy - pan_y) / zoom + cy
+    if not (ox <= x < ox + nw and oy <= y < oy + nh):
+        return None
+    frame_x = int((x - ox) * src_w / nw)
+    frame_y = int((y - oy) * src_h / nh)
+    if not (0 <= frame_x < src_w and 0 <= frame_y < src_h):
+        return None
+    return frame_x, frame_y
 
 
 def draw_hud(canvas, lines, x=16, y=28):
@@ -1278,11 +1397,56 @@ def apply_zoom_pan(canvas, zoom_level, pan_x, pan_y):
     return zoomed
 
 
+def maybe_apply_tracking_zoom(frame, view, enabled=False):
+    """Optional preprocessing layer: apply zoom/pan before eye tracking if enabled.
+
+    When enabled=False (default), returns frame unchanged so zoom stays display-only.
+    """
+    if not enabled or not isinstance(view, dict):
+        return frame
+    zoom = float(view.get("zoom", 1.0)) or 1.0
+    pan_x = float(view.get("pan_x", 0))
+    pan_y = float(view.get("pan_y", 0))
+    if zoom == 1.0 and pan_x == 0 and pan_y == 0:
+        return frame
+    return apply_zoom_pan(frame, zoom, pan_x, pan_y)
+
+
+def prepare_eye_tracking_frame(frame, flip_vertical, flip_horizontal, view, zoom_affects_tracking):
+    """Build the frame + flip flags for eye_tracker.process_frame().
+
+    When zoom_affects_tracking is True, apply flip/mirror then zoom so the tracker
+    sees the same region as the zoomed PiP. Flip flags returned as False because
+    flips already applied. When False, leave frame raw and let process_frame flip.
+    """
+    if not zoom_affects_tracking:
+        return frame, flip_vertical, flip_horizontal
+    out = frame
+    if flip_vertical:
+        out = cv2.flip(out, 0)
+    if flip_horizontal:
+        out = cv2.flip(out, 1)
+    out = maybe_apply_tracking_zoom(out, view, enabled=True)
+    return out, False, False
+
+
 PREVIEW_ROLES = ("left", "right", "front")
 
 
 def default_preview_views():
     return {role: {"zoom": 1.0, "pan_x": 0, "pan_y": 0} for role in PREVIEW_ROLES}
+
+
+def preview_views_from_choice(choice):
+    """Prefer live handoff from setup GUI; fall back to camera_setup.json / defaults."""
+    if isinstance(choice, dict):
+        raw = choice.get("preview_views")
+        if isinstance(raw, dict):
+            return {
+                role: _normalize_preview_view(raw.get(role))
+                for role in PREVIEW_ROLES
+            }
+    return preview_views_from_setup(_load_camera_setup())
 
 
 def preview_view_for(preview_views, role):
@@ -1606,6 +1770,8 @@ def run_simple_pupil(choice):
     if left_index is None and right_index is None:
         print("Need at least one IR eye camera.")
         return
+    if "zoom_affects_tracking" not in choice:
+        choice["zoom_affects_tracking"] = zoom_affects_tracking_from_setup(_load_camera_setup())
 
     # Keep role identity — do not rename right→left when left is missing.
     active_eyes = tuple(
@@ -1652,7 +1818,7 @@ def run_simple_pupil(choice):
     canvas_w = panel_w * n_slots
     canvas_h = panel_h
 
-    preview_views = default_preview_views()
+    preview_views = preview_views_from_choice(choice)
     slot_roles = [
         (eye_id if kind == "eye" else "front") for kind, eye_id in slots
     ]
@@ -1735,11 +1901,16 @@ def run_simple_pupil(choice):
                         continue
                     flip_v = choice["flip_left"] if eye_id == "left" else choice["flip_right"]
                     mirror = choice["mirror_left"] if eye_id == "left" else choice["mirror_right"]
+                    view = preview_view_for(preview_views, eye_id)
+                    zoom_enabled = zoom_affects_tracking_for(choice, eye_id)
+                    tracking_frame, track_flip_v, track_mirror = prepare_eye_tracking_frame(
+                        frame, flip_v, mirror, view, zoom_enabled
+                    )
                     eye_tracker.process_frame(
-                        frame,
+                        tracking_frame,
                         eye_id=eye_id,
-                        flip_vertical=flip_v,
-                        flip_horizontal=mirror,
+                        flip_vertical=track_flip_v,
+                        flip_horizontal=track_mirror,
                     )
                     eye_frame = eye_tracker.get_preview_frame(eye_id)
                     if eye_frame is None:
@@ -1754,7 +1925,11 @@ def run_simple_pupil(choice):
                         continue
                     eye_prev, ox, oy, nw, nh = fit_frame(eye_frame, panel_w, panel_h)
                     role = eye_id
-                    display_panel = render_panel_with_view(eye_prev, preview_views, role)
+                    # When zoom already fed into tracking, skip display zoom to avoid double-apply.
+                    if zoom_enabled:
+                        display_panel = eye_prev
+                    else:
+                        display_panel = render_panel_with_view(eye_prev, preview_views, role)
                     canvas[0:panel_h, ex : ex + panel_w] = display_panel
                     recording_panels[role] = display_panel
                     layout_state["panel_rects"][role] = (ex, 0, panel_w, panel_h)
@@ -1779,6 +1954,8 @@ def run_simple_pupil(choice):
                         "rect": (ex, 0, panel_w, panel_h),
                         "fit": (ox, oy, nw, nh),
                         "src_size": (fw, fh),
+                        "view": dict(preview_view_for(preview_views, eye_id)),
+                        "zoom_affects_tracking": zoom_enabled,
                     }
                 else:
                     snap = front_reader.snapshot_status()
@@ -1915,6 +2092,8 @@ def run(choice):
     if front_index is None:
         print("Need a front camera.")
         return
+    if "zoom_affects_tracking" not in choice:
+        choice["zoom_affects_tracking"] = zoom_affects_tracking_from_setup(_load_camera_setup())
 
     if left_index is None:
         left_index, right_index = right_index, None
@@ -1928,18 +2107,6 @@ def run(choice):
     tracker = sp.ScreenPoseTracker(screen_w, screen_h, width_mm, height_mm, hfov_deg=DEFAULT_HFOV)
     heatmap = GazeHeatmap(screen_w, screen_h)
     scale_calib = GazeScaleCalib()
-    
-    # Initialize recording manager
-    recorder = RecordingManager(output_dir=os.path.join(ROOT, "recordings"))
-    print(f"\n{'='*60}")
-    print(f"📹 RECORDING SETUP (Full GazeScreen3D)")
-    print(f"{'='*60}")
-    print(f"Output folder: {recorder.output_dir}")
-    print(f"Clip duration: {recorder.clip_duration} seconds")
-    print(f"Duration: {recorder.clip_duration}s per preview (left/right/front MP4s)")
-    print(f"CLICK THE RECORD BUTTON (top-right) to start recording")
-    print(f"1/2/3 = focus preview | Z/X/WASD = zoom/pan on focused panel")
-    print(f"{'='*60}\n")
 
     eye_tracker.set_show_separate_tracking_windows(False)
     eye_tracker.calibrated = False
@@ -1973,7 +2140,7 @@ def run(choice):
         [
             "GazeScreen3D starting…",
             "Waiting for camera frames",
-            "Q quit | C | arrows | E | [ ] , . | U M V K | -/+ FOV | R record | Z/X zoom | WASD pan",
+            "Q quit | C | arrows | E | [ ] , . | U M V K | -/+ FOV",
         ],
         x=x1,
         y=36,
@@ -1985,18 +2152,8 @@ def run(choice):
 
     show_previews = True
     pending_edge = None
-    preview_views = default_preview_views()
-    view_state = {
-        "focus": active_eyes[0] if active_eyes else "front",
-        "available": set(active_eyes) | ({"front"} if front_reader is not None else set()),
-    }
-
-    def on_view_control(action):
-        view_state["focus"] = apply_view_action(
-            preview_views, view_state["focus"], action, view_state["available"]
-        )
-
-    layout_state["view_control_callback"] = on_view_control
+    # Zoom/pan is set in the setup GUI and persisted in camera_setup.json — no live HUD here.
+    preview_views = preview_views_from_choice(choice)
     
     print("GazeScreen3D ready.")
     print("1) Point front camera at this window until Pose OK (4/4 ArUco corners)")
@@ -2006,11 +2163,10 @@ def run(choice):
     print("5) Fine-tune: [ ] vertical   , . horizontal")
     print("6) Gaze heatmap follows ray ∩ ArUco plane")
     print("Q quit | C | arrows | E reset | [ ] , . | U M V K | -/+ FOV")
-    print("REC button: L/R/F MP4s | click L/R/F + WASD/Z+/X-/RST")
+    print("Preview zoom/pan: set in setup GUI (stored in camera_setup.json)")
 
     try:
         while True:
-            view_focus = view_state["focus"]
             layout_state["show_previews"] = show_previews
             layout_state["eyes"] = {}
 
@@ -2034,11 +2190,16 @@ def run(choice):
                     continue
                 flip_v = choice["flip_left"] if eye_id == "left" else choice["flip_right"]
                 mirror = choice["mirror_left"] if eye_id == "left" else choice["mirror_right"]
+                view = preview_view_for(preview_views, eye_id)
+                zoom_enabled = zoom_affects_tracking_for(choice, eye_id)
+                tracking_frame, track_flip_v, track_mirror = prepare_eye_tracking_frame(
+                    frame, flip_v, mirror, view, zoom_enabled
+                )
                 eye_tracker.process_frame(
-                    frame,
+                    tracking_frame,
                     eye_id=eye_id,
-                    flip_vertical=flip_v,
-                    flip_horizontal=mirror,
+                    flip_vertical=track_flip_v,
+                    flip_horizontal=track_mirror,
                 )
 
             gaze = eye_tracker.refresh_combined_gaze(active_eyes)
@@ -2105,9 +2266,6 @@ def run(choice):
             tracker.markers.paste_on(canvas)
 
             x1, y1, x2, y2 = tracker.markers.preview_rect()
-            recording_panels = {}
-            layout_state["panel_rects"] = {}
-            layout_state["view_focus"] = view_focus
             
             if show_previews:
                 pw, ph = max(160, x2 - x1), max(120, min(360, (y2 - y1) // 2))
@@ -2118,10 +2276,7 @@ def run(choice):
                     front_base, _, _, _, _ = fit_frame(front_display, pw, ph)
                     front_panel = render_panel_with_view(front_base, preview_views, "front")
                     preview_canvas[0:ph, 0:pw] = front_panel
-                    recording_panels["front"] = front_panel
-                    layout_state["panel_rects"]["front"] = (x1, y1, pw, ph)
-                    f_border = (255, 255, 0) if view_focus == "front" else (180, 180, 180)
-                    cv2.rectangle(preview_canvas, (0, 0), (pw - 1, ph - 1), f_border, 3 if view_focus == "front" else 1)
+                    cv2.rectangle(preview_canvas, (0, 0), (pw - 1, ph - 1), (180, 180, 180), 1)
                     if not eye_tracker.calibrated:
                         draw_front_preview_not_for_c(preview_canvas, 0, 0, pw, ph)
                     cv2.putText(
@@ -2133,7 +2288,7 @@ def run(choice):
                         (255, 255, 255),
                         2,
                     )
-                    canvas[y1 : y1 + ph, x1 : x1 + pw] = front_panel
+                    canvas[y1 : y1 + ph, x1 : x1 + pw] = preview_canvas[0:ph, 0:pw]
                 else:
                     fill_status_panel(
                         preview_canvas,
@@ -2175,21 +2330,22 @@ def run(choice):
                             preview_canvas[eye_y_preview : eye_y_preview + eh, ex_preview : ex_preview + slot_w]
                         continue
                     eye_base, ox, oy, nw, nh = fit_frame(eye_frame, slot_w, eh)
-                    eye_panel = render_panel_with_view(eye_base, preview_views, eye_id)
+                    zoom_enabled = zoom_affects_tracking_for(choice, eye_id)
+                    # Tracking already zoomed when flag is set — skip display zoom.
+                    if zoom_enabled:
+                        eye_panel = eye_base
+                    else:
+                        eye_panel = render_panel_with_view(eye_base, preview_views, eye_id)
                     preview_canvas[eye_y_preview : eye_y_preview + eh, ex_preview : ex_preview + slot_w] = eye_panel
-                    recording_panels[eye_id] = eye_panel
-                    layout_state["panel_rects"][eye_id] = (ex_canvas, eye_y_canvas, slot_w, eh)
 
                     locked = eye_tracker.eye_tracking_states[eye_id].get("sphere_center_locked_2d")
                     border = (0, 255, 0) if locked else (180, 180, 180)
-                    if eye_id == view_focus:
-                        border = (255, 255, 0)
                     cv2.rectangle(
                         preview_canvas,
                         (ex_preview, eye_y_preview),
                         (ex_preview + slot_w, eye_y_preview + eh),
                         border,
-                        3 if eye_id == view_focus else 2,
+                        2,
                     )
                     label = f"{eye_id} {'LOCK' if locked else 'click=center'}"
                     cv2.putText(
@@ -2201,16 +2357,17 @@ def run(choice):
                         (255, 255, 255),
                         1,
                     )
-                    canvas[eye_y_canvas : eye_y_canvas + eh, ex_canvas : ex_canvas + slot_w] = eye_panel
+                    canvas[eye_y_canvas : eye_y_canvas + eh, ex_canvas : ex_canvas + slot_w] = \
+                        preview_canvas[eye_y_preview : eye_y_preview + eh, ex_preview : ex_preview + slot_w]
                     
                     fh, fw = eye_frame.shape[:2]
                     layout_state["eyes"][eye_id] = {
                         "rect": (ex_canvas, eye_y_canvas, slot_w, eh),
                         "fit": (ox, oy, nw, nh),
                         "src_size": (fw, fh),
+                        "view": dict(preview_view_for(preview_views, eye_id)),
+                        "zoom_affects_tracking": zoom_enabled,
                     }
-            else:
-                recording_panels = {}
 
             locked_any = any(
                 eye_tracker.eye_tracking_states[eid].get("sphere_center_locked_2d")
@@ -2247,132 +2404,76 @@ def run(choice):
             else:
                 lines.append("No gaze / no intersection")
 
-            lines.append("Q quit | C | arrows | E | [ ] , . | U M V K | -/+ FOV | REC | 1/2/3 focus | Z/X/WASD")
-            
-            recording_status = recorder.get_status_line()
-            lines.insert(0, preview_view_hud_line(preview_views, view_focus))
-            lines.insert(0, recording_status)
+            lines.append("Q quit | C | arrows | E | [ ] , . | U M V K | -/+ FOV")
             
             draw_hud(canvas, [ln for ln in lines if ln], x=x1, y=36)
-            
-            # Draw record + view-control buttons
-            button_x = screen_w - 200
-            button_y = 20
-            button_rect = draw_record_button(canvas, recorder, button_x, button_y)
-            layout_state["record_button_rect"] = button_rect
-            layout_state["view_control_buttons"] = draw_view_controls(
-                canvas, view_focus, view_state["available"], x=12, y=12
-            )
-            
-            layout_state["recording_panels"] = recording_panels
-
-            def toggle_recording():
-                print(f"\n[BUTTON CLICKED] Record button pressed!")
-                if recorder.is_recording():
-                    recorder.stop_recording()
-                    print("Recording stopped via button.")
-                else:
-                    panels = layout_state.get("recording_panels") or {}
-                    if not panels:
-                        print("Cannot start recording. Preview not ready.")
-                        return
-                    sizes = {role: _panel_size_bgr(panel) for role, panel in panels.items()}
-                    if recorder.start_recording(sizes, fps=30):
-                        print(f"Recording L/R/F previews → {recorder.output_dir}")
-                    else:
-                        print("Failed to start recording!")
-            
-            layout_state["record_button_callback"] = toggle_recording
 
             if eye_tracker.calibrated:
                 draw_edge_targets(canvas, screen_w, screen_h, scale_calib.edges_done)
             else:
                 draw_center_calib_target(canvas, screen_w, screen_h)
 
-            if recorder.is_recording() and recording_panels:
-                recorder.add_frames(recording_panels)
-
             cv2.imshow(WINDOW_NAME, canvas)
 
             key = poll_key()
             if key == ord("q"):
                 break
-            if key == ord("r"):
-                if recorder.is_recording():
-                    recorder.stop_recording()
-                    print("Recording stopped manually.")
-                elif recording_panels:
-                    sizes = {role: _panel_size_bgr(p) for role, p in recording_panels.items()}
-                    if recorder.start_recording(sizes, fps=30):
-                        print(f"Recording L/R/F previews → {recorder.output_dir}")
-                else:
-                    print("No preview panels available. Cannot record.")
-            else:
-                new_focus, handled = handle_preview_view_key(
-                    preview_views, view_focus, key, view_state["available"]
+            if key == ord("c"):
+                calibrate_gaze(active_eyes, scale_calib)
+            elif key == ord("e"):
+                scale_calib.clear_edges()
+                pending_edge = None
+                print("Edge scales reset. C kept.")
+            elif key == ord("["):
+                scale_calib.nudge_vertical(-EDGE_NUDGE)
+                print(f"Vertical -  {scale_calib.scales_summary()}")
+            elif key == ord("]"):
+                scale_calib.nudge_vertical(EDGE_NUDGE)
+                print(f"Vertical +  {scale_calib.scales_summary()}")
+            elif key == ord(","):
+                scale_calib.nudge_horizontal(-EDGE_NUDGE)
+                print(f"Horizontal -  {scale_calib.scales_summary()}")
+            elif key == ord("."):
+                scale_calib.nudge_horizontal(EDGE_NUDGE)
+                print(f"Horizontal +  {scale_calib.scales_summary()}")
+            elif key == ord("u"):
+                unlock_eye_sphere_centers(active_eyes)
+            elif key == ord("m"):
+                print(f"Markers {'ON' if tracker.markers.toggle() else 'OFF'}")
+            elif key == ord("v"):
+                show_previews = not show_previews
+                print(f"Previews {'ON' if show_previews else 'OFF'}")
+            elif key == ord("k"):
+                heatmap.clear()
+                print("Heatmap cleared")
+            elif key in (ord("-"), ord("_")):
+                tracker.set_hfov(tracker.hfov_deg - 2.0)
+                print(f"HFOV {tracker.hfov_deg:.0f}")
+            elif key in (ord("="), ord("+")):
+                tracker.set_hfov(tracker.hfov_deg + 2.0)
+                print(f"HFOV {tracker.hfov_deg:.0f}")
+            elif key == ord("0"):
+                tracker.set_hfov(DEFAULT_HFOV)
+                print(f"HFOV reset {tracker.hfov_deg:.0f}")
+            elif key == ord("h"):
+                print(
+                    "C = center | arrows = 4 edges | E reset | [ ] vertical , . horizontal | "
+                    "click IR = lock eye center | U unlock | zoom set in setup GUI"
                 )
-                if handled:
-                    view_state["focus"] = new_focus
-                elif key == ord("c"):
-                    calibrate_gaze(active_eyes, scale_calib)
-                elif key == ord("e"):
-                    scale_calib.clear_edges()
-                    pending_edge = None
-                    print("Edge scales reset. C kept.")
-                elif key == ord("["):
-                    scale_calib.nudge_vertical(-EDGE_NUDGE)
-                    print(f"Vertical -  {scale_calib.scales_summary()}")
-                elif key == ord("]"):
-                    scale_calib.nudge_vertical(EDGE_NUDGE)
-                    print(f"Vertical +  {scale_calib.scales_summary()}")
-                elif key == ord(","):
-                    scale_calib.nudge_horizontal(-EDGE_NUDGE)
-                    print(f"Horizontal -  {scale_calib.scales_summary()}")
-                elif key == ord("."):
-                    scale_calib.nudge_horizontal(EDGE_NUDGE)
-                    print(f"Horizontal +  {scale_calib.scales_summary()}")
-                elif key == ord("u"):
-                    unlock_eye_sphere_centers(active_eyes)
-                elif key == ord("m"):
-                    print(f"Markers {'ON' if tracker.markers.toggle() else 'OFF'}")
-                elif key == ord("v"):
-                    show_previews = not show_previews
-                    print(f"Previews {'ON' if show_previews else 'OFF'}")
-                elif key == ord("k"):
-                    heatmap.clear()
-                    print("Heatmap cleared")
-                elif key in (ord("-"), ord("_")):
-                    tracker.set_hfov(tracker.hfov_deg - 2.0)
-                    print(f"HFOV {tracker.hfov_deg:.0f}")
-                elif key in (ord("="), ord("+")):
-                    tracker.set_hfov(tracker.hfov_deg + 2.0)
-                    print(f"HFOV {tracker.hfov_deg:.0f}")
-                elif key == ord("0"):
-                    tracker.set_hfov(DEFAULT_HFOV)
-                    print(f"HFOV reset {tracker.hfov_deg:.0f}")
-                elif key == ord("h"):
-                    print(
-                        "C = center | arrows = 4 edges | E reset | [ ] vertical , . horizontal | "
-                        "click IR = lock eye center | U unlock | R = record L/R/F | "
-                        "click L/R/F + WASD/Z+/X-/RST"
-                    )
-                else:
-                    edge = _arrow_to_edge(key)
-                    if edge is not None:
-                        if not eye_tracker.calibrated:
-                            print("Press C at screen center before edge arrows.")
-                        elif not tracker.ready or tracker._rotation is None:
-                            print("Wait for ArUco pose before edge arrows.")
-                        else:
-                            pending_edge = _begin_edge_capture(edge)
-                            print(
-                                f"Capturing {edge} ({EDGE_CALIB_FRAMES} frames) — "
-                                f"keep looking at the {edge} cross..."
-                            )
+            else:
+                edge = _arrow_to_edge(key)
+                if edge is not None:
+                    if not eye_tracker.calibrated:
+                        print("Press C at screen center before edge arrows.")
+                    elif not tracker.ready or tracker._rotation is None:
+                        print("Wait for ArUco pose before edge arrows.")
+                    else:
+                        pending_edge = _begin_edge_capture(edge)
+                        print(
+                            f"Capturing {edge} ({EDGE_CALIB_FRAMES} frames) — "
+                            f"keep looking at the {edge} cross..."
+                        )
     finally:
-        # Stop recording if active
-        recorder.stop_recording()
-        
         stopped = set()
         for reader in list(readers.values()) + [front_reader]:
             if id(reader) in stopped:
