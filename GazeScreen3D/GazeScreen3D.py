@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import sys
 import threading
 import time
@@ -38,8 +37,10 @@ sys.path.insert(0, _ARUCO)
 sys.path.insert(0, ROOT)
 
 CAMERA_SETUP_PATH = os.path.join(ROOT, "camera_setup.json")
+# Placeholder device_id when no stable OS identifier is available; never resolved.
+_SYNTHETIC_ID_PREFIX = "Camera_"
 
-from camera_io import CAMERA_CAPTURE_MODES, CameraReader
+from camera_io import CAMERA_CAPTURE_MODES, CameraReader, win_cameras
 from gaze_scale_calib import (
     GazeScaleCalib,
     draw_center_calib_target,
@@ -165,34 +166,34 @@ def _placeholder_photo(tk, width, height, rgb=(34, 34, 34)):
     return tk.PhotoImage(data=header + row * height, format="PPM")
 
 
-def _list_windows_pnp_cameras():
-    """Return [{name, device_id}, ...] from Windows PnP Camera class (stable InstanceId)."""
-    if sys.platform != "win32":
-        return []
-    cmd = (
-        "Get-PnpDevice -Class Camera -Status OK | "
-        "ForEach-Object { $_.FriendlyName + '|' + $_.InstanceId }"
+def _synthetic_device_id(index):
+    return f"{_SYNTHETIC_ID_PREFIX}{index}"
+
+
+def _stable_device_id(device_id):
+    """device_id if it identifies a physical device, else None (index-only fallback)."""
+    if not device_id or device_id.startswith(_SYNTHETIC_ID_PREFIX):
+        return None
+    return device_id
+
+
+def _enumerate_capture_devices(max_cams):
+    """[(index, device_id, name), ...] for capture endpoints in CAP_MSMF index order.
+
+    On Windows, SetupAPI's KSCATEGORY_VIDEO_CAMERA interfaces are the MSMF
+    endpoints themselves. The PnP Camera class is not: it also lists non-capture
+    siblings (e.g. IR MI_02), so pairing it with OpenCV indices by list position
+    assigns the wrong IDs. Elsewhere fall back to probing with synthetic IDs.
+    """
+    devices = win_cameras.list_capture_devices() if win_cameras is not None else None
+    if devices is not None:
+        return [(d["index"], d["device_id"], d["name"]) for d in devices]
+
+    indices = sp.detect_cameras(
+        max_cams=max_cams,
+        backends=tuple(backend for _name, backend, _fourcc in CAMERA_CAPTURE_MODES),
     )
-    try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", cmd],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return []
-    devices = []
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if not line or "|" not in line:
-            continue
-        name, device_id = line.split("|", 1)
-        name, device_id = name.strip(), device_id.strip()
-        if name and device_id:
-            devices.append({"name": name, "device_id": device_id})
-    return devices
+    return [(index, _synthetic_device_id(index), f"Camera {index}") for index in indices]
 
 
 def detect_cameras_with_names(max_cams=10):
@@ -201,34 +202,14 @@ def detect_cameras_with_names(max_cams=10):
     Returns list of (index, device_id, display_name).
     display_name looks like \"0: USB Camera\" (index suffix on duplicate names).
     """
-    indices = sp.detect_cameras(
-        max_cams=max_cams,
-        backends=tuple(backend for _name, backend, _fourcc in CAMERA_CAPTURE_MODES),
-    )
-    if not indices:
-        return []
-
-    pnp = _list_windows_pnp_cameras()
+    devices = _enumerate_capture_devices(max_cams)
     name_counts = {}
-    for entry in pnp:
-        name_counts[entry["name"]] = name_counts.get(entry["name"], 0) + 1
-    name_seen = {}
+    for _index, _did, name in devices:
+        name_counts[name] = name_counts.get(name, 0) + 1
 
     cameras = []
-    for i, index in enumerate(indices):
-        if i < len(pnp):
-            name = pnp[i]["name"]
-            device_id = pnp[i]["device_id"]
-        else:
-            name = f"Camera {index}"
-            device_id = f"Camera_{index}"
-
-        if name_counts.get(name, 0) > 1:
-            seen = name_seen.get(name, 0)
-            name_seen[name] = seen + 1
-            label = f"{name} ({index})"
-        else:
-            label = name
+    for index, device_id, name in devices:
+        label = f"{name} ({index})" if name_counts.get(name, 0) > 1 else name
         display = f"{index}: {label}"
         cameras.append((index, device_id, display))
     return cameras
@@ -275,7 +256,7 @@ def _device_id_for_index(cameras_info, index):
     for idx, did, _display in cameras_info:
         if idx == index:
             return did
-    return f"Camera_{index}"
+    return _synthetic_device_id(index)
 
 
 def _parse_camera_selection(value):
@@ -316,8 +297,10 @@ def selection_gui():
         if entry and isinstance(entry, dict):
             device_id = entry.get("device_id")
             index = _index_for_device_id(info, device_id)
-            if index is None and entry.get("index") is not None:
-                # Device missing from PnP map — try last known index if still present.
+            if index is None and _stable_device_id(device_id) is None and entry.get("index") is not None:
+                # No stable ID was ever known — try last known index if still present.
+                # A stable ID that is missing means that device is unplugged; its old
+                # index now belongs to another camera, so it must stay unbound.
                 want = int(entry["index"])
                 if any(idx == want for idx, _d, _n in info):
                     index = want
@@ -449,6 +432,7 @@ def selection_gui():
         else:
             state["role_device"][role] = _device_id_for_index(state["cameras_info"], index)
             status_lbl.config(text=f"Opening camera {index} for {role}…")
+        device_id = state["role_device"][role]
 
         def worker():
             with _cam_lock:
@@ -459,7 +443,12 @@ def selection_gui():
                     return
                 if index is None:
                     return
-                reader = CameraReader(index, width=640, height=480)
+                reader = CameraReader(
+                    index,
+                    width=640,
+                    height=480,
+                    device_id=_stable_device_id(device_id),
+                )
                 reader.start()
 
             def apply():
@@ -718,6 +707,10 @@ def selection_gui():
         choice["mirror_right"] = mirror_right.get()
         choice["flip_front"] = flip_front.get()
         choice["mirror_front"] = mirror_front.get()
+        choice["device_ids"] = {
+            role: _stable_device_id(entry["device_id"]) if entry else None
+            for role, entry in setup.items()
+        }
         # Handoff as index → reader (run() expects that shape).
         handed = {}
         for role, reader in readers.items():
@@ -897,15 +890,21 @@ def run(choice):
     eye_tracker.reset_gaze_smoothing()
 
     pre_readers = choice.pop("readers", None) or {}
+    device_ids = choice.get("device_ids") or {}
     by_index = {}
 
-    def take_reader(index, label):
+    def take_reader(role, index, label):
         if index in by_index:
             return by_index[index]
         reader = pre_readers.pop(index, None)
         if reader is None:
             print(f"Opening {label} camera {index}…")
-            reader = CameraReader(index, width=640, height=480)
+            reader = CameraReader(
+                index,
+                width=640,
+                height=480,
+                device_id=device_ids.get(role),
+            )
             reader.start()
             print(f"{label} {index}: {reader.backend_name or 'opening…'}")
         else:
@@ -921,10 +920,10 @@ def run(choice):
     for eye_id, index in (("left", left_index), ("right", right_index)):
         if index is None:
             continue
-        readers[eye_id] = take_reader(index, f"{eye_id} IR")
+        readers[eye_id] = take_reader(eye_id, index, f"{eye_id} IR")
         eye_tracker.reset_eye_tracking_state(eye_id)
 
-    front_reader = take_reader(front_index, "Front")
+    front_reader = take_reader("front", front_index, "Front")
 
     for leftover in pre_readers.values():
         leftover.stop()

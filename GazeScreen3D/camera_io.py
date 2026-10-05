@@ -6,6 +6,11 @@ import time
 
 import cv2
 
+if sys.platform == "win32":
+    import win_cameras
+else:
+    win_cameras = None
+
 # MSMF only on Windows, no DirectShow fallback: with 3 cameras sharing one USB 2.0
 # link, DirectShow starves to ~1 fps and serves other cameras' buffers (black or
 # foreign frames). MSMF stays clean on the same hardware (see diag_multicam.py).
@@ -60,10 +65,22 @@ def open_camera_capture(index, width=None, height=None, fps_request=CAPTURE_TARG
 
 
 class CameraReader:
-    """Background capture with throttled reads and auto-reconnect."""
+    """Background capture with throttled reads and auto-reconnect.
 
-    def __init__(self, index, width=640, height=480, fps_request=CAPTURE_TARGET_FPS):
+    With a device_id, every (re)open re-resolves the MSMF index from SetupAPI:
+    Windows renumbers capture indices when any camera drops, so reopening the
+    old index can bind to a different physical device. If the device is absent
+    the reader stays OFFLINE instead of opening whatever now sits at that index.
+    """
+
+    def __init__(self, index, width=640, height=480, fps_request=CAPTURE_TARGET_FPS, device_id=None):
+        # index: the selection key callers matched this reader against (setup
+        # GUI dropdown, role handoff). capture_index: the live MSMF index, which
+        # may move away from index after a reconnect.
         self.index = index
+        self.capture_index = index
+        self.device_id = device_id
+        self._device_absent = False
         self.width = width
         self.height = height
         self.fps_request = fps_request
@@ -81,13 +98,40 @@ class CameraReader:
 
         self._open_capture()
 
+    def _resolve_capture_index(self):
+        """Current MSMF index for self.device_id; None when the device is absent.
+
+        Without a device_id, or when enumeration is unavailable, the last known
+        capture index is kept (legacy index-only behaviour).
+        """
+        if not self.device_id or win_cameras is None:
+            return self.capture_index
+        devices = win_cameras.list_capture_devices()
+        if devices is None:
+            return self.capture_index
+        return win_cameras.find_index_for_device_id(devices, self.device_id)
+
     def _open_capture(self):
         if self.cap is not None:
             self.cap.release()
             self.cap = None
 
+        resolved = self._resolve_capture_index()
+        if resolved is None:
+            if not self._device_absent:
+                print(f"Camera {self.device_id}: device not present, staying OFFLINE.")
+            self._device_absent = True
+            self.status = "OFFLINE"
+            return
+        if self._device_absent:
+            print(f"Camera {self.device_id}: device present again at index {resolved}.")
+        self._device_absent = False
+        if resolved != self.capture_index:
+            print(f"Camera {self.device_id}: index moved {self.capture_index} -> {resolved}.")
+            self.capture_index = resolved
+
         self.cap, self.backend_name = open_camera_capture(
-            self.index,
+            self.capture_index,
             self.width,
             self.height,
             self.fps_request,
@@ -117,17 +161,19 @@ class CameraReader:
             self._has_frame = False
 
     def _reconnect(self):
-        self.status = "RECONNECTING"
+        self.status = "OFFLINE" if self._device_absent else "RECONNECTING"
         self._clear_frame()
-        print(f"Camera {self.index}: reconnecting ({self.backend_name or 'auto'})...")
+        if not self._device_absent:
+            print(f"Camera {self.capture_index}: reconnecting ({self.backend_name or 'auto'})...")
+        # Cooldown also rate-limits SetupAPI polling while the device is unplugged.
         time.sleep(RECONNECT_COOLDOWN_SEC)
         if self._stop.is_set():
             return
         self._open_capture()
         if self.is_opened():
-            print(f"Camera {self.index}: reconnected with {self.backend_name}.")
-        else:
-            print(f"Camera {self.index}: reconnect failed.")
+            print(f"Camera {self.capture_index}: reconnected with {self.backend_name}.")
+        elif not self._device_absent:
+            print(f"Camera {self.capture_index}: reconnect failed.")
 
     def _capture_loop(self):
         frame_count = 0
