@@ -346,53 +346,59 @@ def apply_binary_threshold(image, darkestPixelValue, addedThreshold):
     This means that all pixels with a value less than the threshold are set to 0, 
     and all pixels with a value greater than the threshold are set to 255.
     """
-    threshold = darkestPixelValue + addedThreshold
+    threshold = int(darkestPixelValue) + int(addedThreshold)
     _, thresholded_image = cv2.threshold(image, threshold, 255, cv2.THRESH_BINARY_INV)
     return thresholded_image
 
 
 def get_darkest_area(image):
-    """Coarse pupil seed: scan for the darkest 20×20 patch, return its center (x, y).
+    """Coarse pupil seed: darkest searchArea×searchArea patch center (x, y).
 
     Used by process_frame before thresholding. Not the final pupil center, only a starting point
     for apply_binary_threshold + mask_outside_square.
 
-    WARNING/TODO: slow (Python triple loop). Any dark artifact (lash, shadow, frame edge)
-    can win over the real pupil.
+    Vectorized box-filter sum (same grid as the old Python loops). Any dark artifact
+    (lash, shadow, frame edge) can still win over the real pupil.
     """
-    # Step 1: search grid tuning: skip image borders and sample sparsely for speed
-    ignoreBounds = 20       # ignore outer rim (often noisy / vignetting)
-    imageSkipSize = 10      # coarse grid step across the frame
-    searchArea = 20         # window size (px) summed at each grid point
-    internalSkipSize = 5    # subsample inside each window (not every pixel)
+    ignoreBounds = 20
+    imageSkipSize = 10
+    searchArea = 20
+    internalSkipSize = 5
 
-    # Step 2: luminance only: pupil is darkest region in IR
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    min_sum = float("inf")
-    darkest_point = None
+    h, w = gray.shape
+    if h < ignoreBounds * 2 + searchArea or w < ignoreBounds * 2 + searchArea:
+        return (w // 2, h // 2)
 
-    # Step 3: walk coarse grid; at each (x,y) score a local window
-    for y in range(ignoreBounds, gray.shape[0] - ignoreBounds, imageSkipSize):
-        for x in range(ignoreBounds, gray.shape[1] - ignoreBounds, imageSkipSize):
-            current_sum = 0
-            num_pixels = 0
-            # Step 4: sum gray values inside searchArea×searchArea (lower sum = darker patch)
-            for dy in range(0, searchArea, internalSkipSize):
-                if y + dy >= gray.shape[0]:
-                    break
-                for dx in range(0, searchArea, internalSkipSize):
-                    if x + dx >= gray.shape[1]:
-                        break
-                    current_sum += gray[y + dy][x + dx]
-                    num_pixels += 1
+    # Subsample like the old internalSkipSize loop, then integral-image box sums.
+    sampled = gray[::internalSkipSize, ::internalSkipSize].astype(np.float64)
+    win = max(1, searchArea // internalSkipSize)
+    integral = cv2.integral(sampled)
+    box = (
+        integral[win:, win:]
+        - integral[:-win, win:]
+        - integral[win:, :-win]
+        + integral[:-win, :-win]
+    )
 
-            # Step 5: keep the darkest window; center of window = pupil seed
-            if current_sum < min_sum and num_pixels > 0:
-                min_sum = current_sum
-                darkest_point = (x + searchArea // 2, y + searchArea // 2)
+    y0 = ignoreBounds // internalSkipSize
+    x0 = ignoreBounds // internalSkipSize
+    step = max(1, imageSkipSize // internalSkipSize)
+    y1 = max(y0 + 1, (h - ignoreBounds - searchArea) // internalSkipSize + 1)
+    x1 = max(x0 + 1, (w - ignoreBounds - searchArea) // internalSkipSize + 1)
+    y1 = min(y1, box.shape[0])
+    x1 = min(x1, box.shape[1])
+    if y1 <= y0 or x1 <= x0:
+        return (w // 2, h // 2)
 
-    # Step 6: (x, y) passed to threshold + 250×250 mask in process_frame
-    return darkest_point
+    region = box[y0:y1:step, x0:x1:step]
+    if region.size == 0:
+        return (w // 2, h // 2)
+
+    iy, ix = np.unravel_index(int(np.argmin(region)), region.shape)
+    sx = x0 + ix * step
+    sy = y0 + iy * step
+    return (int(sx * internalSkipSize + searchArea // 2), int(sy * internalSkipSize + searchArea // 2))
 
 def mask_outside_square(image, center, size):
     """Zero everything outside a size x size square centered on center.
@@ -747,7 +753,11 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
     
     final_rotated_rect = None
 
-    if final_contours and not isinstance(final_contours[0], list) and len(final_contours[0] > 5):
+    if (
+        final_contours
+        and not isinstance(final_contours[0], list)
+        and len(final_contours[0]) > 5
+    ):
         ellipse = cv2.fitEllipse(final_contours[0])
         final_rotated_rect = ellipse
 
@@ -809,11 +819,9 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
 
     if final_rotated_rect is not None and center_x is not None and center_y is not None:
         cv2.line(frame, model_center_average, (center_x, center_y), (255, 150, 50), 2)  # # Draw line from eye center to ellipse center
-        
-    cv2.ellipse(frame, final_rotated_rect, (20, 255, 255), 2) #draw final ellipse on image
+        cv2.ellipse(frame, final_rotated_rect, (20, 255, 255), 2)  # draw final ellipse on image
 
-    # Calculate the extended endpoint of gaze line
-    if final_rotated_rect is not None and center_x is not None and center_y is not None:
+        # Calculate the extended endpoint of gaze line
         # Compute the vector from model_center_average to center_x, center_y
         dx = center_x - model_center_average[0]
         dy = center_y - model_center_average[1]
@@ -823,10 +831,7 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
         extended_y = int(model_center_average[1] + 2 * dy)
 
         # Draw the extended gaze line
-        cv2.line(frame, (center_x, center_y), (extended_x, extended_y), (200, 255, 0), 3) 
-
-
-
+        cv2.line(frame, (center_x, center_y), (extended_x, extended_y), (200, 255, 0), 3)
 
     if render_cv_window:
         cv2.imshow("Best Thresholded Image Contours on Frame", frame)
