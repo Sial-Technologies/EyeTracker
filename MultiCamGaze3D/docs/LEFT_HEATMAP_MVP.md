@@ -21,14 +21,13 @@ multcam-intrinsics --role left_eye
   PnP scale — OS/GDI size is shown for comparison only and is **not** trusted.
 - Optional but recommended: `left.eye_center_front_mm` (eyeball vs front cam, mm).
 - Optional but recommended: `left.eye_center_ir_px` (locked Orlosky 2D center).
-  Set zoom/pan first in `multcam-preview`, look into the IR camera, left-click the
-  left panel to lock at the pupil, Enter to save. Right-click unlocks.
-- Left IR mount: set `"flip": true` if the camera is upside-down. When
-  `zoom_affects_tracking` is true, flip/mirror is applied **before** zoom/pan so
-  pan offsets match the upright frame. Sensor remap undoes that flip for `K`;
-  the Orlosky→OpenCV Y conversion then **skips** its extra Y negate so pitch is
-  not double-flipped / crushed. Look-at grid bottom sits just above the PiPs
-  (`max(margin, pip_clear)`, not margin+pip).
+  Set mount flip/mirror first in `multcam-preview`, look into the IR camera,
+  left-click the left panel to lock at the pupil, Enter to save. Right-click unlocks.
+- Left IR mount: set `"flip": true` if the camera is upside-down. Sensor remap
+  undoes that flip for `K`; the Orlosky→OpenCV Y conversion then **skips** its
+  extra Y negate so pitch is not double-flipped / crushed. There is no digital
+  zoom/pan — IR unprojection uses Phase-0 `left_eye` intrinsics only. Look-at
+  grid bottom sits just above the PiPs (`max(margin, pip_clear)`, not margin+pip).
 
 ## Run
 
@@ -57,7 +56,7 @@ On-screen status shows **cam↔screen** distance (m / mm) from live ArUco PnP wh
 markers are locked — sanity-check against a tape measure.
 
 Fullscreen window shows corner ArUco (IDs 0–3), a red look-at target, and a
-bottom-center row with **left IR** (flip/zoom/pan from `camera_setup.json`) plus
+bottom-center row with **left IR** (flip/mirror from `camera_setup.json`) plus
 front preview. Status text sits below the top markers. ArUco is drawn last so UI
 never covers markers.
 
@@ -150,7 +149,7 @@ fall back to rays from the front-camera origin (MVP approximation).
 
 `eye_center_ir_px` freezes Orlosky’s **2D** eyeball center in the IR tracking buffer
 (not metric \(E\)). Prefer locking while looking into the IR camera so pupil ≈ center;
-do this after finalizing flip/zoom/pan that affect tracking.
+do this after finalizing mount flip/mirror.
 
 ## Geometry (pipeline detail)
 
@@ -163,13 +162,12 @@ do this after finalizing flip/zoom/pan that affect tracking.
   Stored \(T_{\mathrm{front}\leftarrow\mathrm{left}}\) uses translation \(E\) and rotation \(R\).
 - Heatmap: live ray ∩ screen plane → soft blob overlay (**not** a 2D UV regression).
 
-When `zoom_affects_tracking` is true, pupil/eye-center pixels are **remapped to raw sensor
-space** (undo Orlosky 640×480 crop, digital zoom/pan, then flips) before unprojection.
-Prefer Phase 0 `left_eye` intrinsics (`K` + `dist`); otherwise fall back to datasheet
-`IR_FOV_Y`. Do **not** use `FOV/z` when pan≠0 — that only matches a centered crop and
-shifts the principal point under pan. If config `flip` is true, that undo already
-inverts vertical sense vs the upright eye frame — exported gaze must **not** also
-apply the usual Orlosky Y-up → OpenCV Y-down negate (see `orlosky_to_opencv_direction`).
+Pupil/eye-center pixels are **remapped to raw sensor space** (undo Orlosky 640×480
+crop, then mount flips) before unprojection. Prefer Phase 0 `left_eye` intrinsics
+(`K` + `dist`); otherwise fall back to datasheet `IR_FOV_Y`. If config `flip` is
+true, that undo already inverts vertical sense vs the upright eye frame — exported
+gaze must **not** also apply the usual Orlosky Y-up → OpenCV Y-down negate (see
+`orlosky_to_opencv_direction`).
 
 Yaw/pitch **direction scales** are a soft residual (prior toward 1) for leftover FOV
 error. 2D affine / yaw-pitch→UV fits may still be written as **diagnostics** in the JSON;

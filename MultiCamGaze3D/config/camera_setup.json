@@ -4,12 +4,6 @@
     "index": 1,
     "flip": true,
     "mirror": false,
-    "view": {
-      "zoom": 1.0,
-      "pan_x": 0,
-      "pan_y": 0
-    },
-    "zoom_affects_tracking": true,
     "eye_center_front_mm": [
       -45.0,
       27.5,
@@ -25,12 +19,6 @@
     "index": 0,
     "flip": false,
     "mirror": true,
-    "view": {
-      "zoom": 1.6,
-      "pan_x": -40,
-      "pan_y": -30
-    },
-    "zoom_affects_tracking": true,
     "eye_center_front_mm": [
       40.0,
       25.0,
@@ -41,12 +29,6 @@
     "device_id": "USB\\VID_0BDA&PID_5697&MI_00\\7&1EA1D4FB&0&0000",
     "index": 3,
     "flip": false,
-    "mirror": false,
-    "view": {
-      "zoom": 1.0,
-      "pan_x": 0,
-      "pan_y": 0
-    },
-    "zoom_affects_tracking": false
+    "mirror": false
   }
 }

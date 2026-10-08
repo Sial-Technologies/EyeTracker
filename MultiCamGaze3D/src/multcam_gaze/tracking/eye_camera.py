@@ -1,4 +1,4 @@
-"""Resolve IR unprojection model (intrinsics + zoom/pan remap)."""
+"""Resolve IR unprojection model (Phase-0 intrinsics + crop/flip remap)."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from multcam_gaze.tracking.eye_tracker import IR_FOV_Y_DEG
-from multcam_gaze.tracking.pixel_remap import TrackerPixelMap, ZoomPan
+from multcam_gaze.tracking.pixel_remap import TrackerPixelMap
 from multcam_gaze.types import CameraRole, IntrinsicsModel
 from multcam_gaze.vision.intrinsics import load_intrinsics, vfov_from_k, intrinsics_path
 
@@ -31,28 +31,20 @@ def resolve_eye_unproject_model(
     sensor_height: int,
     flip_vertical: bool,
     flip_horizontal: bool,
-    view: dict | None,
-    zoom_affects_tracking: bool,
     calib_dir: Path | None = None,
     role: CameraRole = "left_eye",
     fallback_fov_y_deg: float = float(IR_FOV_Y_DEG),
 ) -> EyeUnprojectModel:
-    """Build sensor-space unprojection for the prepared tracking frame.
+    """Build sensor-space unprojection for the raw tracking frame.
 
-    When ``zoom_affects_tracking`` is true the frame is already flipped + zoomed;
-    the map undoes zoom/pan then flips. Otherwise flips happen inside
-    ``process_frame`` and the map only undoes those flips (+ crop).
+    Flips happen inside ``process_frame``; the map undoes those flips and the
+    Orlosky 640×480 crop so ``K`` / ``dist`` apply in calibration sensor space.
     """
-    zoom_pan = ZoomPan.from_view(view) if zoom_affects_tracking else None
-    # Flips to undo from Orlosky coords back to calibration sensor space.
-    undo_v = bool(flip_vertical)
-    undo_h = bool(flip_horizontal)
     pixel_map = TrackerPixelMap(
         sensor_width=int(sensor_width),
         sensor_height=int(sensor_height),
-        zoom_pan=zoom_pan,
-        undo_flip_vertical=undo_v,
-        undo_flip_horizontal=undo_h,
+        undo_flip_vertical=bool(flip_vertical),
+        undo_flip_horizontal=bool(flip_horizontal),
     )
 
     model: IntrinsicsModel | None = None

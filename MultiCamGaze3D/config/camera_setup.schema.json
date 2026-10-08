@@ -14,7 +14,6 @@
         "index": { "type": "integer" },
         "flip": { "type": "boolean" },
         "mirror": { "type": "boolean" },
-        "zoom_affects_tracking": { "type": "boolean" },
         "eye_center_front_mm": {
           "type": "array",
           "minItems": 3,
@@ -27,15 +26,7 @@
           "minItems": 2,
           "maxItems": 2,
           "items": { "type": "number" },
-          "description": "Locked Orlosky 2D eyeball center in the IR tracking buffer (px). Freeze after look-into-IR (pupil ≈ center). Set zoom/pan that affect tracking before locking."
-        },
-        "view": {
-          "type": "object",
-          "properties": {
-            "zoom": { "type": "number" },
-            "pan_x": { "type": "number" },
-            "pan_y": { "type": "number" }
-          }
+          "description": "Locked Orlosky 2D eyeball center in the IR tracking buffer (px). Freeze after look-into-IR (pupil ≈ center). Set mount flip/mirror before locking."
         }
       }
     }

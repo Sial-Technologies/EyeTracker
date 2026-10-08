@@ -35,7 +35,6 @@ from multcam_gaze.hardware.preview_view import (
     eye_center_front_mm_from_setup,
     eye_center_ir_px_from_setup,
     load_camera_setup,
-    normalize_preview_view,
     prepare_eye_tracking_frame,
     role_camera_index,
 )
@@ -450,10 +449,6 @@ def main(argv: list[str] | None = None) -> int:
     left_entry = setup.get("left") if isinstance(setup.get("left"), dict) else {}
     flip_v = bool(left_entry.get("flip", False))
     flip_h = bool(left_entry.get("mirror", False))
-    left_view = normalize_preview_view(
-        left_entry.get("view") if isinstance(left_entry.get("view"), dict) else None
-    )
-    zoom_tracking = bool(left_entry.get("zoom_affects_tracking", False))
     eye_origin_front = eye_center_front_mm_from_setup(setup, "left")
 
     front_intrinsics = require_intrinsics(calib_dir, "front")
@@ -769,19 +764,13 @@ def main(argv: list[str] | None = None) -> int:
     if flip_v or flip_h:
         print(
             f"  Left IR flips: vertical={flip_v} horizontal={flip_h} "
-            f"(flip applied before zoom when zoom_affects_tracking)"
+            f"(applied inside process_frame; undone for K)"
         )
     # Probe IR unproject once we have a live left frame (printed after first read).
-    left_unproject_note = (
-        f"sensor remap + IR K (fallback FOV_y={float(IR_FOV_Y_DEG):.0f}°); "
-        f"zoom_affects_tracking={zoom_tracking}"
+    print(
+        f"  Left IR unproject: crop/flip remap + Phase-0 K "
+        f"(fallback FOV_y={float(IR_FOV_Y_DEG):.0f}°)"
     )
-    if zoom_tracking:
-        left_unproject_note += (
-            f" zoom={left_view['zoom']:.2f} "
-            f"pan=({left_view['pan_x']:.0f},{left_view['pan_y']:.0f})"
-        )
-    print(f"  Left IR unproject: {left_unproject_note}")
     print(
         f"  Eye center (front mm): "
         f"[{eye_origin_front[0]:.1f}, {eye_origin_front[1]:.1f}, {eye_origin_front[2]:.1f}] "
@@ -809,8 +798,6 @@ def main(argv: list[str] | None = None) -> int:
                     left,
                     flip_v,
                     flip_h,
-                    left_view,
-                    zoom_tracking,
                 )
                 lh, lw = left.shape[:2]
                 unproject = resolve_eye_unproject_model(
@@ -818,8 +805,6 @@ def main(argv: list[str] | None = None) -> int:
                     sensor_height=lh,
                     flip_vertical=flip_v,
                     flip_horizontal=flip_h,
-                    view=left_view,
-                    zoom_affects_tracking=zoom_tracking,
                     calib_dir=calib_dir,
                     role="left_eye",
                 )
@@ -846,8 +831,6 @@ def main(argv: list[str] | None = None) -> int:
                     eye.get_preview_frame("left"),
                     flip_v,
                     flip_h,
-                    left_view,
-                    zoom_tracking,
                 )
 
             if mode == "warmup" and readiness.ready:
@@ -985,22 +968,13 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 y += 26
 
-            # Left IR PiP - same flip/zoom/pan as multcam-preview.
+            # Left IR PiP - same flip/mirror as multcam-preview.
             if eye_panel is not None:
                 thumb = cv2.resize(eye_panel, (eye_tw, eye_th))
                 label = "eye READY" if readiness.ready else "eye warmup"
                 color = (0, 255, 0) if readiness.ready else (0, 165, 255)
                 cv2.putText(
                     thumb, label, (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2
-                )
-                cv2.putText(
-                    thumb,
-                    f"z={left_view['zoom']:.1f} pan={left_view['pan_x']},{left_view['pan_y']}",
-                    (8, eye_th - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.45,
-                    (220, 220, 220),
-                    1,
                 )
                 canvas[eye_y0 : eye_y0 + eye_th, eye_x0 : eye_x0 + eye_tw] = thumb
 

@@ -190,8 +190,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     if result.scale_yaw < 0.5 or result.scale_pitch < 0.5:
         print(
-            "HINT: solved yaw/pitch scales << 1 — check left_eye.npz, sensor remap "
-            "(zoom/pan), and that pan is not applied without pixel remap."
+            "HINT: solved yaw/pitch scales << 1 — check left_eye.npz and that "
+            "crop/flip sensor remap matches Phase-0 IR intrinsics."
         )
 
     flipped = []

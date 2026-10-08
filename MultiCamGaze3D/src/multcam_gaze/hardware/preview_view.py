@@ -1,4 +1,4 @@
-"""Preview zoom/pan (pure OpenCV warps)."""
+"""Preview display helpers (flip/mirror only; no digital zoom/pan)."""
 
 from __future__ import annotations
 
@@ -12,83 +12,27 @@ from numpy.typing import NDArray
 from multcam_gaze.types import PREVIEW_ROLES
 
 
-def apply_zoom_pan(
-    canvas: NDArray[np.uint8],
-    zoom_level: float,
-    pan_x: float,
-    pan_y: float,
-) -> NDArray[np.uint8]:
-    if zoom_level == 1.0 and pan_x == 0 and pan_y == 0:
-        return canvas
-    h, w = canvas.shape[:2]
-    center_x, center_y = w / 2, h / 2
-    m = cv2.getRotationMatrix2D((center_x, center_y), 0, zoom_level)
-    m[0, 2] += pan_x
-    m[1, 2] += pan_y
-    return cv2.warpAffine(
-        canvas,
-        m,
-        (w, h),
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=(0, 0, 0),
-    )
-
-
 def apply_camera_display(
     frame: NDArray[np.uint8],
     flip_vertical: bool,
     flip_horizontal: bool,
-    view: dict | None,
 ) -> NDArray[np.uint8]:
-    """Operator preview: flip/mirror first, then zoom/pan (matches tracking crop)."""
+    """Operator preview: mount flip/mirror only."""
     out = frame
     if flip_vertical:
         out = cv2.flip(out, 0)
     if flip_horizontal:
         out = cv2.flip(out, 1)
-    v = normalize_preview_view(view if isinstance(view, dict) else None)
-    return apply_zoom_pan(out, v["zoom"], v["pan_x"], v["pan_y"])
+    return out
 
 
 def prepare_eye_tracking_frame(
     frame: NDArray[np.uint8],
     flip_vertical: bool,
     flip_horizontal: bool,
-    view: dict | None,
-    zoom_affects_tracking: bool,
 ) -> tuple[NDArray[np.uint8], bool, bool]:
-    """Frame + flip flags for eye_tracker.process_frame.
-
-    When zoom affects tracking, apply flip/mirror *before* zoom/pan so pan offsets
-    match the upright (post-flip) image the operator tuned in preview. Flip flags
-    returned as False because they are already applied.
-    """
-    if not zoom_affects_tracking:
-        return frame, flip_vertical, flip_horizontal
-    return (
-        apply_camera_display(frame, flip_vertical, flip_horizontal, view),
-        False,
-        False,
-    )
-
-
-def effective_tracking_fov_y_deg(
-    zoom_affects_tracking: bool,
-    view: dict | None,
-    *,
-    base_fov_y_deg: float = 80.0,
-) -> float:
-    """Legacy FOV for centered digital zoom when sensor remapping is unavailable.
-
-    Prefer remapping tracker pixels to sensor space + calibrated IR ``K`` (see
-    ``tracking.pixel_remap``). ``FOV/z`` is only exact for pan≈0; with pan the
-    principal point shifts and this approximation biases gaze angles.
-    """
-    base = float(base_fov_y_deg)
-    if not zoom_affects_tracking:
-        return base
-    zoom = float(normalize_preview_view(view)["zoom"])
-    return base / max(zoom, 1e-6)
+    """Frame + flip flags for eye_tracker.process_frame (raw buffer; flips deferred)."""
+    return frame, flip_vertical, flip_horizontal
 
 
 def compose_eye_preview_panel(
@@ -96,24 +40,11 @@ def compose_eye_preview_panel(
     overlay: NDArray[np.uint8] | None,
     flip_vertical: bool,
     flip_horizontal: bool,
-    view: dict | None,
-    zoom_affects_tracking: bool,
 ) -> NDArray[np.uint8]:
-    """IR panel matching multcam-preview: configured flip/zoom, plus tracker overlay when available.
-
-    When zoom affects tracking, the overlay was drawn on the zoomed frame — use it.
-    Otherwise zoom is display-only: start from overlay (already flipped by tracker) or
-    the configured display transform of the raw frame.
-    """
-    configured = apply_camera_display(
-        raw_frame, flip_vertical, flip_horizontal, view
-    )
-    if overlay is None:
-        return configured
-    if zoom_affects_tracking:
+    """IR panel: tracker overlay when available, else flip-oriented raw frame."""
+    if overlay is not None:
         return overlay
-    v = normalize_preview_view(view if isinstance(view, dict) else None)
-    return apply_zoom_pan(overlay, v["zoom"], v["pan_x"], v["pan_y"])
+    return apply_camera_display(raw_frame, flip_vertical, flip_horizontal)
 
 
 def make_status_panel(
@@ -135,25 +66,6 @@ def make_status_panel(
     return panel
 
 
-def normalize_preview_view(view: dict | None) -> dict:
-    if not isinstance(view, dict):
-        return {"zoom": 1.0, "pan_x": 0, "pan_y": 0}
-    try:
-        zoom = float(view.get("zoom", 1.0))
-    except (TypeError, ValueError):
-        zoom = 1.0
-    try:
-        pan_x = int(round(float(view.get("pan_x", 0))))
-        pan_y = int(round(float(view.get("pan_y", 0))))
-    except (TypeError, ValueError):
-        pan_x, pan_y = 0, 0
-    return {
-        "zoom": max(0.5, min(5.0, round(zoom, 1))),
-        "pan_x": pan_x,
-        "pan_y": pan_y,
-    }
-
-
 def load_camera_setup(path: Path) -> dict:
     if not path.is_file():
         return {}
@@ -164,18 +76,9 @@ def load_camera_setup(path: Path) -> dict:
 
 
 def save_camera_setup(path: Path, setup: dict) -> None:
-    """Persist role entries (device_id, index, flip, mirror, view, …)."""
+    """Persist role entries (device_id, index, flip, mirror, …)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(setup, indent=2) + "\n", encoding="utf-8")
-
-
-def preview_views_from_setup(setup: dict) -> dict:
-    views = {role: {"zoom": 1.0, "pan_x": 0, "pan_y": 0} for role in PREVIEW_ROLES}
-    for role in PREVIEW_ROLES:
-        entry = setup.get(role)
-        if isinstance(entry, dict) and isinstance(entry.get("view"), dict):
-            views[role] = normalize_preview_view(entry["view"])
-    return views
 
 
 def flip_mirror_from_setup(setup: dict) -> dict[str, dict[str, bool]]:
@@ -187,15 +90,6 @@ def flip_mirror_from_setup(setup: dict) -> dict[str, dict[str, bool]]:
                 "flip": bool(entry.get("flip", False)),
                 "mirror": bool(entry.get("mirror", False)),
             }
-    return flags
-
-
-def zoom_affects_tracking_from_setup(setup: dict) -> dict[str, bool]:
-    flags = {role: False for role in PREVIEW_ROLES}
-    for role in PREVIEW_ROLES:
-        entry = setup.get(role)
-        if isinstance(entry, dict):
-            flags[role] = bool(entry.get("zoom_affects_tracking", False))
     return flags
 
 
@@ -257,10 +151,12 @@ def set_eye_center_ir_px(
 
 def merge_setup_display(
     setup: dict,
-    views: dict[str, dict],
     flips: dict[str, dict[str, bool]],
 ) -> dict:
-    """Update flip/mirror/view on existing role entries; leave device_id/index alone."""
+    """Update flip/mirror on existing role entries; leave device_id/index alone.
+
+    Strips legacy ``view`` / ``zoom_affects_tracking`` keys if present.
+    """
     out: dict = {}
     for role in PREVIEW_ROLES:
         entry = setup.get(role)
@@ -270,7 +166,8 @@ def merge_setup_display(
         role_flips = flips.get(role, {})
         updated["flip"] = bool(role_flips.get("flip", entry.get("flip", False)))
         updated["mirror"] = bool(role_flips.get("mirror", entry.get("mirror", False)))
-        updated["view"] = normalize_preview_view(views.get(role))
+        updated.pop("view", None)
+        updated.pop("zoom_affects_tracking", None)
         out[role] = updated
     # Preserve any non-role keys if present.
     for key, value in setup.items():

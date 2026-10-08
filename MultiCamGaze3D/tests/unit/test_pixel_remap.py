@@ -1,41 +1,17 @@
-"""Sensor remapping for zoom/pan and Orlosky crop."""
+"""Sensor remapping for Orlosky crop and mount flips."""
 
 from __future__ import annotations
 
 import numpy as np
 
-from multcam_gaze.tracking.pixel_remap import (
-    TrackerPixelMap,
-    ZoomPan,
-    invert_zoom_pan_point,
-    zoom_pan_affine,
-)
+from multcam_gaze.tracking.pixel_remap import TrackerPixelMap
 from multcam_gaze.vision.intrinsics import vfov_from_k
 
 
-def test_invert_zoom_pan_roundtrip_with_pan() -> None:
+def test_tracker_pixel_map_identity_when_orlosky_matches_sensor() -> None:
     w, h = 640, 480
-    zoom, pan_x, pan_y = 2.3, 80.0, -30.0
-    # Sensor optical center must land at (cx+pan, cy+pan) in the buffer.
-    cx, cy = w / 2.0, h / 2.0
-    m = zoom_pan_affine(w, h, zoom, pan_x, pan_y)
-    buf = m @ np.array([cx, cy, 1.0])
-    np.testing.assert_allclose(buf[:2], [cx + pan_x, cy + pan_y], atol=1e-6)
-    back = invert_zoom_pan_point(buf[0], buf[1], w, h, zoom, pan_x, pan_y)
-    np.testing.assert_allclose(back, [cx, cy], atol=1e-6)
-
-
-def test_tracker_pixel_map_undoes_zoom_pan_before_unproject() -> None:
-    w, h = 640, 480
-    zoom, pan_x, pan_y = 2.0, 40.0, 0.0
-    # Orlosky == sensor size → crop is identity. Buffer pixel at optical axis.
-    buf_x, buf_y = w / 2.0 + pan_x, h / 2.0 + pan_y
-    m = TrackerPixelMap(
-        sensor_width=w,
-        sensor_height=h,
-        zoom_pan=ZoomPan(zoom, pan_x, pan_y),
-    )
-    xs, ys = m.to_sensor(buf_x, buf_y)
+    m = TrackerPixelMap(sensor_width=w, sensor_height=h)
+    xs, ys = m.to_sensor(w / 2.0, h / 2.0)
     np.testing.assert_allclose([xs, ys], [w / 2.0, h / 2.0], atol=1e-6)
 
 

@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "front-pixel-gaze"
+version = "0.1.0"
+description = "Orlosky IR gaze mapped to front-camera pixels via click calibration"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24",
+  "opencv-python>=4.8",
+]
+
+[project.scripts]
+front-pixel-gaze = "front_pixel_gaze.app:main"
+
+[tool.setuptools.packages.find]
+include = ["front_pixel_gaze*"]

@@ -1,0 +1,14 @@
+{
+  "left": {
+    "device_id": "USB\\VID_0C45&PID_6366&MI_00\\8&183AF011&0&0000",
+    "index": 0,
+    "flip": true,
+    "mirror": false
+  },
+  "front": {
+    "device_id": "USB\\VID_0BDA&PID_5697&MI_00\\7&1EA1D4FB&0&0000",
+    "index": 2,
+    "flip": false,
+    "mirror": false
+  }
+}

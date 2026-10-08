@@ -1,4 +1,4 @@
-"""Orlosky-style 3D IR eye tracker for GazeScreen3D (standalone copy)."""
+"""Orlosky-style 3D IR eye tracker — MultiCamGaze3D tracking/eye_tracker.py (vendored)."""
 
 import cv2
 import random
@@ -10,8 +10,8 @@ import time
 
 MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# gl_sphere.py lives in 3DTracker (folder name is not a valid package, so path insert).
-_GL_SPHERE_DIR = os.path.normpath(os.path.join(MODULE_DIR, "..", "3DTracker"))
+# gl_sphere.py lives in repo 3DTracker/ (sibling of FrontPixelGaze/).
+_GL_SPHERE_DIR = os.path.normpath(os.path.join(MODULE_DIR, "..", "..", "3DTracker"))
 if _GL_SPHERE_DIR not in sys.path:
     sys.path.insert(0, _GL_SPHERE_DIR)
 
@@ -1507,7 +1507,7 @@ def process_frame(
     try:
         # If caller did not supply a map, still undo in-process flips + crop.
         if pixel_map is None:
-            from multcam_gaze.tracking.pixel_remap import TrackerPixelMap
+            from front_pixel_gaze.pixel_remap import TrackerPixelMap
 
             pixel_map = TrackerPixelMap(
                 sensor_width=pre_w,

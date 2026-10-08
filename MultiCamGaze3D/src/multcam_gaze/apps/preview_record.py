@@ -1,4 +1,4 @@
-"""Multi-camera preview with zoom/pan and recording."""
+"""Multi-camera preview with flip/mirror and recording."""
 
 from __future__ import annotations
 
@@ -22,11 +22,9 @@ from multcam_gaze.hardware.preview_view import (
     make_status_panel,
     merge_setup_display,
     prepare_eye_tracking_frame,
-    preview_views_from_setup,
     role_camera_index,
     save_camera_setup,
     set_eye_center_ir_px,
-    zoom_affects_tracking_from_setup,
 )
 from multcam_gaze.hardware.recording import RecordingManager
 from multcam_gaze.paths import project_root
@@ -55,9 +53,7 @@ def main(argv: list[str] | None = None) -> int:
 
     setup_path = config_dir / "camera_setup.json"
     setup = load_camera_setup(setup_path)
-    views = preview_views_from_setup(setup)
     flips = flip_mirror_from_setup(setup)
-    zoom_tracking = zoom_affects_tracking_from_setup(setup)
     readers: dict[str, CameraReader] = {}
     for role in PREVIEW_ROLES:
         idx, device_id = role_camera_index(setup, role)
@@ -102,11 +98,10 @@ def main(argv: list[str] | None = None) -> int:
     cv2.setMouseCallback("MultiCam Preview", on_mouse)
 
     print(
-        "Keys: 1/2/3 focus | Z/X zoom | WASD pan | R reset view | "
-        "F flip | M mirror | Enter save setup | Space record | Q quit"
+        "Keys: 1/2/3 focus | F flip | M mirror | Enter save setup | Space record | Q quit"
     )
     print("  Left/right show pupil + eyeball overlay from the eye tracker.")
-    print("  Flip/mirror then zoom (same order as tracking when zoom_affects_tracking).")
+    print("  Unprojection uses Phase-0 IR intrinsics after crop/flip undo (no digital zoom/pan).")
     print(
         "  Mouse on L/R: left-click locks eye center at current pupil "
         "(look into IR first); right-click unlocks."
@@ -119,7 +114,6 @@ def main(argv: list[str] | None = None) -> int:
             for role, reader in readers.items():
                 ok, frame = reader.read()
                 if ok and frame is not None:
-                    v = views[role]
                     flags = flips[role]
                     if role in EYE_ROLES:
                         panel = _eye_panel_with_overlay(
@@ -128,16 +122,14 @@ def main(argv: list[str] | None = None) -> int:
                             role,
                             flags["flip"],
                             flags["mirror"],
-                            v,
-                            zoom_tracking.get(role, False),
                             calib_dir,
                         )
                     else:
                         panel = apply_camera_display(
-                            frame, flags["flip"], flags["mirror"], v
+                            frame, flags["flip"], flags["mirror"]
                         )
                     last_sizes[role] = (panel.shape[1], panel.shape[0])
-                    _annotate_panel(panel, role, v, flags, eye)
+                    _annotate_panel(panel, role, flags, eye)
                     display_panels[role] = panel
                     live_panels[role] = panel
                     continue
@@ -153,7 +145,7 @@ def main(argv: list[str] | None = None) -> int:
                         f"cam{reader.capture_index}",
                         str(snap["status"]),
                         "no frame",
-                        "Z/X WASD R F M still edit",
+                        "F M still edit",
                     ],
                 )
 
@@ -182,32 +174,7 @@ def main(argv: list[str] | None = None) -> int:
                 focus = "right"
             if key == ord("3") and "front" in readers:
                 focus = "front"
-            v = views[focus]
             flags = flips[focus]
-            if key == ord("z"):
-                v["zoom"] = min(5.0, round(v["zoom"] + 0.1, 1))
-                dirty = True
-            if key == ord("x"):
-                v["zoom"] = max(0.5, round(v["zoom"] - 0.1, 1))
-                dirty = True
-            if key == ord("w"):
-                v["pan_y"] -= 10
-                dirty = True
-            if key == ord("s"):
-                v["pan_y"] += 10
-                dirty = True
-            if key == ord("a"):
-                v["pan_x"] -= 10
-                dirty = True
-            if key == ord("d"):
-                v["pan_x"] += 10
-                dirty = True
-            if key in (ord("r"), ord("R")):
-                v["zoom"] = 1.0
-                v["pan_x"] = 0
-                v["pan_y"] = 0
-                dirty = True
-                print(f"{focus}: view reset zoom=1.0 pan=0,0")
             if key in (ord("f"), ord("F")):
                 flags["flip"] = not flags["flip"]
                 dirty = True
@@ -217,7 +184,7 @@ def main(argv: list[str] | None = None) -> int:
                 dirty = True
                 print(f"{focus}: mirror={flags['mirror']}")
             if key in (13, 10):  # Enter - persist to camera_setup.json
-                _persist(setup_path, setup, views, flips)
+                _persist(setup_path, setup, flips)
                 dirty = False
             if key == ord(" "):
                 if recorder.is_recording():
@@ -230,7 +197,7 @@ def main(argv: list[str] | None = None) -> int:
                         recorder.start_recording(sizes)
     finally:
         if dirty:
-            _persist(setup_path, setup, views, flips)
+            _persist(setup_path, setup, flips)
             print("Saved pending preview edits on exit.")
         recorder.stop_recording()
         for r in readers.values():
@@ -254,13 +221,11 @@ def _eye_panel_with_overlay(
     eye_id: str,
     flip_v: bool,
     flip_h: bool,
-    view: dict,
-    zoom_affects_tracking: bool,
     calib_dir: Path,
 ) -> NDArray[np.uint8]:
-    """Run Orlosky tracking and return the preview panel (config flip/zoom + overlay)."""
+    """Run Orlosky tracking and return the preview panel (flip + overlay)."""
     tracking_frame, track_flip_v, track_flip_h = prepare_eye_tracking_frame(
-        frame, flip_v, flip_h, view, zoom_affects_tracking
+        frame, flip_v, flip_h
     )
     h, w = frame.shape[:2]
     role = "left_eye" if eye_id == "left" else "right_eye"
@@ -269,8 +234,6 @@ def _eye_panel_with_overlay(
         sensor_height=h,
         flip_vertical=flip_v,
         flip_horizontal=flip_h,
-        view=view,
-        zoom_affects_tracking=zoom_affects_tracking,
         calib_dir=calib_dir,
         role=role,
     )
@@ -286,18 +249,15 @@ def _eye_panel_with_overlay(
         eye.get_preview_frame(eye_id),
         flip_v,
         flip_h,
-        view,
-        zoom_affects_tracking,
     )
 
 
 def _persist(
     setup_path: Path,
     setup: dict,
-    views: dict[str, dict],
     flips: dict[str, dict[str, bool]],
 ) -> None:
-    merged = merge_setup_display(setup, views, flips)
+    merged = merge_setup_display(setup, flips)
     save_camera_setup(setup_path, merged)
     setup.clear()
     setup.update(merged)
@@ -307,7 +267,6 @@ def _persist(
 def _annotate_panel(
     panel: NDArray[np.uint8],
     role: str,
-    view: dict,
     flags: dict[str, bool],
     eye: EyeTrackerAdapter | None = None,
 ) -> None:
@@ -326,7 +285,6 @@ def _annotate_panel(
         lock_txt = f" LOCK{locked}" if locked is not None else " auto"
     cv2.putText(
         panel,
-        f"z={view['zoom']:.1f} pan={view['pan_x']},{view['pan_y']} "
         f"flip={int(flags['flip'])} mir={int(flags['mirror'])}{lock_txt}",
         (8, panel.shape[0] - 10),
         cv2.FONT_HERSHEY_SIMPLEX,
