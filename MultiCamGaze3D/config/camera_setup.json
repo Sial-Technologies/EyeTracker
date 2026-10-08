@@ -1,0 +1,52 @@
+{
+  "left": {
+    "device_id": "USB\\VID_0C45&PID_6366&MI_00\\8&183AF011&0&0000",
+    "index": 1,
+    "flip": true,
+    "mirror": false,
+    "view": {
+      "zoom": 1.0,
+      "pan_x": 0,
+      "pan_y": 0
+    },
+    "zoom_affects_tracking": true,
+    "eye_center_front_mm": [
+      -45.0,
+      27.5,
+      -70.0
+    ],
+    "eye_center_ir_px": [
+      303,
+      332
+    ]
+  },
+  "right": {
+    "device_id": "USB\\VID_0C45&PID_6366&MI_00\\8&6F2A11A&0&0000",
+    "index": 0,
+    "flip": false,
+    "mirror": true,
+    "view": {
+      "zoom": 1.6,
+      "pan_x": -40,
+      "pan_y": -30
+    },
+    "zoom_affects_tracking": true,
+    "eye_center_front_mm": [
+      40.0,
+      25.0,
+      -37.0
+    ]
+  },
+  "front": {
+    "device_id": "USB\\VID_0BDA&PID_5697&MI_00\\7&1EA1D4FB&0&0000",
+    "index": 3,
+    "flip": false,
+    "mirror": false,
+    "view": {
+      "zoom": 1.0,
+      "pan_x": 0,
+      "pan_y": 0
+    },
+    "zoom_affects_tracking": false
+  }
+}

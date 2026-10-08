@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    paths:
+      - "MultiCamGaze3D/**"
+  pull_request:
+    paths:
+      - "MultiCamGaze3D/**"
+
+defaults:
+  run:
+    working-directory: MultiCamGaze3D
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: pip install -e ".[dev,viz]"
+      - name: Ruff
+        run: ruff check src tests
+      - name: Pytest
+        run: pytest tests/unit tests/integration --cov=multcam_gaze --cov-report=term-missing

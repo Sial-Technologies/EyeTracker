@@ -1,0 +1,6 @@
+{
+  "inner_corners_cols": 9,
+  "inner_corners_rows": 6,
+  "square_size_mm": 25.0,
+  "min_poses": 10
+}

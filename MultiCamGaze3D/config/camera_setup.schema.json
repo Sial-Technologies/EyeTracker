@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "left": { "$ref": "#/$defs/role" },
+    "right": { "$ref": "#/$defs/role" },
+    "front": { "$ref": "#/$defs/role" }
+  },
+  "$defs": {
+    "role": {
+      "type": "object",
+      "properties": {
+        "device_id": { "type": "string" },
+        "index": { "type": "integer" },
+        "flip": { "type": "boolean" },
+        "mirror": { "type": "boolean" },
+        "zoom_affects_tracking": { "type": "boolean" },
+        "eye_center_front_mm": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": { "type": "number" },
+          "description": "Eyeball center in front-camera OpenCV frame (mm): X right, Y down, Z forward toward screen. Used as gaze ray origin in world≡front."
+        },
+        "eye_center_ir_px": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": { "type": "number" },
+          "description": "Locked Orlosky 2D eyeball center in the IR tracking buffer (px). Freeze after look-into-IR (pupil ≈ center). Set zoom/pan that affect tracking before locking."
+        },
+        "view": {
+          "type": "object",
+          "properties": {
+            "zoom": { "type": "number" },
+            "pan_x": { "type": "number" },
+            "pan_y": { "type": "number" }
+          }
+        }
+      }
+    }
+  }
+}

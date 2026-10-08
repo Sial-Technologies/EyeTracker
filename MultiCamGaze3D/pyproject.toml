@@ -1,0 +1,72 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "multcam-gaze"
+version = "0.1.0"
+description = "Three-camera eye-tracking device calibration and gaze mapping"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.24",
+    "opencv-python>=4.8",
+]
+
+[project.optional-dependencies]
+viz = ["matplotlib>=3.7"]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "ruff>=0.4",
+    "mypy>=1.8",
+    "pre-commit>=3.6",
+]
+
+[project.scripts]
+multcam-intrinsics = "multcam_gaze.apps.calibrate_intrinsics:main"
+multcam-left-heatmap = "multcam_gaze.apps.calibrate_left_heatmap:main"
+multcam-analyze-left-samples = "multcam_gaze.apps.analyze_left_samples:main"
+multcam-refine-eye-center = "multcam_gaze.apps.refine_eye_center:main"
+multcam-preview = "multcam_gaze.apps.preview_record:main"
+multcam-show-chessboard = "multcam_gaze.apps.show_chessboard:main"
+
+[tool.setuptools.package-data]
+multcam_gaze = ["py.typed"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/multcam_gaze/tracking/eye_tracker.py" = ["E501", "F401", "F841"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+packages = ["multcam_gaze"]
+
+[[tool.mypy.overrides]]
+module = [
+    "multcam_gaze.tracking.eye_tracker",
+    "multcam_gaze.hardware.win_cameras",
+    "multcam_gaze.viz.*",
+    "multcam_gaze.apps.*",
+]
+ignore_errors = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.coverage.run]
+source = ["multcam_gaze"]
+omit = ["*/tracking/eye_tracker.py", "*/apps/*"]
