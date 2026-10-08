@@ -101,6 +101,10 @@ class EyeTrackerAdapter:
             eye_id, min_confidence=min_confidence
         )
 
+    def freeze_sphere_center(self, eye_id: str) -> tuple[int, int] | None:
+        """Freeze current adapted 2D center after warmup (no pupil snap)."""
+        return eye_tracker.freeze_sphere_center(eye_id)
+
     def unlock_sphere_center(self, eye_id: str) -> bool:
         """Resume auto eyeball-center estimation."""
         return bool(eye_tracker.unlock_sphere_center(eye_id))

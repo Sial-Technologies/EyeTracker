@@ -15,9 +15,10 @@ from multcam_gaze.types import IntrinsicsModel
 _ARUCO_DICT = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
 _DETECTOR = cv2.aruco.ArucoDetector(_ARUCO_DICT, cv2.aruco.DetectorParameters())
 
-MARKER_SIZE_MIN = 80
-MARKER_SIZE_MAX = 220
-MARKER_SIZE_DIVISOR = 8
+# Sized for reliable front-cam detection at glasses distance (~180px on 1080p).
+MARKER_SIZE_MIN = 120
+MARKER_SIZE_MAX = 280
+MARKER_SIZE_DIVISOR = 6
 MAX_REPROJ_ERROR_PX = 12.0
 
 
@@ -99,6 +100,9 @@ class ScreenPoseEstimate:
     front_from_screen: Transform
     reprojection_error_px: float
     markers_found: int
+    # FrontPixelGaze-style 2D map: undistorted front outer corners → screen UV.
+    front_to_screen_h: NDArray[np.float64] | None = None
+    front_quad_corners: NDArray[np.float64] | None = None  # 4x2, ids 0..3 order
 
 
 class CornerMarkers:
@@ -221,13 +225,19 @@ class LiveScreenPose:
 
         obj_list: list[NDArray[np.float64]] = []
         img_list: list[NDArray[np.float64]] = []
+        # Outer corners for FrontPixelGaze front→screen homography (undistorted).
+        outer_raw: dict[int, NDArray[np.float64]] = {}
         found = 0
         for i, mid in enumerate(ids.ravel()):
             mid_i = int(mid)
             if mid_i not in self._object_points:
                 continue
+            c = corners[i].reshape(4, 2).astype(np.float64)
             obj_list.append(self._object_points[mid_i])
-            img_list.append(corners[i].reshape(-1, 2).astype(np.float64))
+            img_list.append(c)
+            # OpenCV corner order TL,TR,BR,BL — pick the outer corner for that id.
+            if mid_i in (0, 1, 2, 3):
+                outer_raw[mid_i] = c[mid_i]
             found += 1
         if found < 2:
             self.last = None
@@ -269,7 +279,38 @@ class LiveScreenPose:
         )
         self._prev_rvec = np.asarray(rvec, dtype=np.float64).reshape(3, 1)
         self._prev_tvec = np.asarray(tvec, dtype=np.float64).reshape(3, 1)
-        est = ScreenPoseEstimate(front_from_screen, rms, found)
+
+        front_h: NDArray[np.float64] | None = None
+        front_quad: NDArray[np.float64] | None = None
+        if all(i in outer_raw for i in (0, 1, 2, 3)):
+            raw = np.array(
+                [outer_raw[0], outer_raw[1], outer_raw[2], outer_raw[3]],
+                dtype=np.float64,
+            )
+            und = cv2.undistortPoints(
+                raw.reshape(-1, 1, 2), k, dist, P=k
+            ).reshape(4, 2)
+            dst = np.array(
+                [
+                    [0.0, 0.0],
+                    [self.screen_width_px - 1.0, 0.0],
+                    [self.screen_width_px - 1.0, self.screen_height_px - 1.0],
+                    [0.0, self.screen_height_px - 1.0],
+                ],
+                dtype=np.float64,
+            )
+            h_mat, _ = cv2.findHomography(und, dst, method=0)
+            if h_mat is not None:
+                front_h = np.asarray(h_mat, dtype=np.float64)
+                front_quad = und
+
+        est = ScreenPoseEstimate(
+            front_from_screen,
+            rms,
+            found,
+            front_to_screen_h=front_h,
+            front_quad_corners=front_quad,
+        )
         self.last = est
         return est
 

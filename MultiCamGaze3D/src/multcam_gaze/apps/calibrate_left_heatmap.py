@@ -37,6 +37,14 @@ from multcam_gaze.hardware.preview_view import (
     load_camera_setup,
     prepare_eye_tracking_frame,
     role_camera_index,
+    save_camera_setup,
+    set_eye_center_ir_px,
+)
+from multcam_gaze.runtime.front_uv_overlay import (
+    FrontUvMap,
+    default_front_uv_map_path,
+    front_uv_to_screen,
+    load_front_uv_map,
 )
 from multcam_gaze.runtime.gaze_pipeline import gaze_to_world_ray, intersect_gaze_with_screen
 from multcam_gaze.runtime.screen_pose import (
@@ -307,6 +315,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "(default with --heatmap-only: <calib-dir>/device_calibration.json)"
         ),
     )
+    parser.add_argument(
+        "--front-uv-map",
+        type=Path,
+        default=None,
+        help=(
+            "FrontPixelGaze front_uv_map.json for red 2D overlay "
+            f"(default: {default_front_uv_map_path()})"
+        ),
+    )
+    parser.add_argument(
+        "--no-front-uv-map",
+        action="store_true",
+        help="Disable FrontPixelGaze 2D overlay even if the map file exists",
+    )
     add_standard_paths(parser)
     return parser.parse_args(argv)
 
@@ -318,20 +340,24 @@ def nine_or_n_grid(
     margin_frac: float = 0.12,
     *,
     bottom_clear_px: float = 0.0,
+    side_clear_px: float = 0.0,
 ) -> list[tuple[float, float]]:
-    """Square look-at grid; optional extra bottom clearance (e.g. front preview).
+    """Square look-at grid; optional clearance for ArUco / front preview.
 
-    ``bottom_clear_px`` is an alternate bottom inset (PiP height), not stacked on
-    top of ``margin_frac * h`` — use max so the grid still reaches just above PiPs.
+    ``side_clear_px`` / ``bottom_clear_px`` are alternate insets (not stacked on
+    ``margin_frac``) — use max so targets stay clear of corner markers and PiPs.
     """
     side = int(round(n**0.5))
     if side * side != n:
         raise ValueError(f"grid size must be square (9/16/25), got {n}")
-    mx = margin_frac * w
-    my_top = margin_frac * h
+    side_clear = max(0.0, float(side_clear_px))
+    mx = max(margin_frac * w, side_clear)
+    my_top = max(margin_frac * h, side_clear)
     my_bottom = max(margin_frac * h, max(0.0, float(bottom_clear_px)))
     if my_top + my_bottom >= h:
         my_bottom = margin_frac * h
+    if 2.0 * mx >= w:
+        mx = margin_frac * w
     xs = np.linspace(mx, w - mx, side)
     ys = np.linspace(my_top, h - my_bottom, side)
     return [(float(x), float(y)) for y in ys for x in xs]
@@ -390,6 +416,59 @@ def _draw_target(canvas: NDArray[np.uint8], uv: tuple[float, float], label: str)
         (255, 255, 255),
         2,
     )
+
+
+def _draw_ab_legend(
+    canvas: NDArray[np.uint8],
+    *,
+    clear: int,
+    has_frontpixel: bool,
+) -> None:
+    """Top-right legend: green = MultiCam 3D, red = FrontPixelGaze 2D."""
+    h, w = canvas.shape[:2]
+    box_w, box_h = 320, 78 if has_frontpixel else 52
+    x1 = w - clear - UI_PAD
+    y0 = clear + UI_PAD
+    x0 = x1 - box_w
+    y1 = y0 + box_h
+    if x0 < clear or y1 > h - clear:
+        return
+    overlay = canvas[y0:y1, x0:x1].copy()
+    cv2.rectangle(overlay, (0, 0), (box_w - 1, box_h - 1), (32, 32, 32), -1)
+    cv2.addWeighted(overlay, 0.65, canvas[y0:y1, x0:x1], 0.35, 0, canvas[y0:y1, x0:x1])
+    cv2.rectangle(canvas, (x0, y0), (x1 - 1, y1 - 1), (180, 180, 180), 1)
+
+    row1 = y0 + 22
+    cx = x0 + 22
+    cv2.circle(canvas, (cx, row1), 10, (0, 255, 0), 2)
+    cv2.putText(
+        canvas,
+        "3D  MultiCam ray ∩ plane",
+        (x0 + 42, row1 + 6),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (0, 255, 0),
+        2,
+    )
+    if has_frontpixel:
+        row2 = y0 + 52
+        cv2.drawMarker(
+            canvas,
+            (cx, row2),
+            (0, 0, 255),
+            markerType=cv2.MARKER_TILTED_CROSS,
+            markerSize=16,
+            thickness=2,
+        )
+        cv2.putText(
+            canvas,
+            "2D  FrontPixel yaw/pitch→UV",
+            (x0 + 42, row2 + 6),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 0, 255),
+            2,
+        )
 
 
 def _accumulate_heatmap(
@@ -514,12 +593,15 @@ def main(argv: list[str] | None = None) -> int:
     front_k = front_intrinsics.scaled_for_frame(fw, fh)
 
     screen_pose = LiveScreenPose(screen_w, screen_h, width_mm, height_mm, front_k)
-    # Keep look-at points above the bottom-center front preview.
+    clear = _marker_clearance(screen_pose.markers)
+    # Keep look-ats clear of corner ArUco and above the bottom-center PiPs.
+    pip_clear = float(max(PREVIEW_H, EYE_PIP_H) + 2 * UI_PAD)
     targets = nine_or_n_grid(
         args.grid,
         screen_w,
         screen_h,
-        bottom_clear_px=float(max(PREVIEW_H, EYE_PIP_H) + 2 * UI_PAD),
+        side_clear_px=float(clear),
+        bottom_clear_px=max(float(clear), pip_clear),
     )
     samples: list[RayExtrinsicSample] = []
     burst: list[RayExtrinsicSample] = []
@@ -530,6 +612,7 @@ def main(argv: list[str] | None = None) -> int:
     scale_yaw = 1.0
     scale_pitch = 1.0
     eye = EyeTrackerAdapter()
+    setup_path = config_dir / "camera_setup.json"
     left_ir_lock = eye_center_ir_px_from_setup(setup, "left")
     if left_ir_lock is not None:
         eye.apply_locked_eye_center_ir_px("left", left_ir_lock)
@@ -541,7 +624,6 @@ def main(argv: list[str] | None = None) -> int:
     mode = "warmup"  # warmup | calib | heatmap
     last_abort_reason = ""
     logged_ir_model = False
-    clear = _marker_clearance(screen_pose.markers)
     status_x, status_y0 = _status_origin(screen_w, clear)
     eye_roi, front_roi = _bottom_pip_rois(screen_w, screen_h, clear)
     eye_x0, eye_y0, eye_tw, eye_th = eye_roi
@@ -552,10 +634,30 @@ def main(argv: list[str] | None = None) -> int:
     # Live snapshot for right-click compare (updated each frame in heatmap mode).
     live_debug: dict = {
         "pred_uv": None,
+        "pred_uv_2d": None,
         "ray_origin": None,
         "ray_dir": None,
         "pose_est": None,
     }
+
+    front_uv_map: FrontUvMap | None = None
+    if not args.no_front_uv_map:
+        map_path = (
+            Path(args.front_uv_map)
+            if args.front_uv_map is not None
+            else default_front_uv_map_path()
+        )
+        front_uv_map = load_front_uv_map(map_path)
+        if front_uv_map is not None:
+            print(
+                f"FrontPixelGaze 2D map: {map_path}  "
+                f"rms={front_uv_map.rms_px:.1f}px n={front_uv_map.n_samples}"
+            )
+        else:
+            print(
+                f"FrontPixelGaze 2D map not found ({map_path}); "
+                "green 3D only. Fit in FrontPixelGaze or pass --front-uv-map."
+            )
 
     def _flush_dump(*, quiet: bool = False) -> None:
         if args.dump_samples is None or last_solve is None:
@@ -580,6 +682,7 @@ def main(argv: list[str] | None = None) -> int:
             return
         truth = (float(x), float(y))
         pred = live_debug.get("pred_uv")
+        pred_2d = live_debug.get("pred_uv_2d")
         pose = live_debug.get("pose_est")
         truth_front = None
         if pose is not None:
@@ -599,24 +702,36 @@ def main(argv: list[str] | None = None) -> int:
         debug_compares.append(cmp_)
         if len(debug_compares) > MAX_DEBUG_COMPARES:
             del debug_compares[0 : len(debug_compares) - MAX_DEBUG_COMPARES]
-        if cmp_.pred_uv is None:
+        if cmp_.pred_uv is None and pred_2d is None:
             print(
                 f"Debug click truth=({truth[0]:.0f},{truth[1]:.0f}) — "
                 "no predicted gaze hit this frame"
             )
             _flush_dump(quiet=True)
             return
-        print(
-            f"Debug click truth=({truth[0]:.0f},{truth[1]:.0f})  "
-            f"pred=({cmp_.pred_uv[0]:.0f},{cmp_.pred_uv[1]:.0f})  "
-            f"Δ=({cmp_.du_px:+.0f},{cmp_.dv_px:+.0f})px  "
-            f"|err|={cmp_.err_px:.0f}px / {cmp_.err_mm:.1f}mm"
-            + (
-                f"  ang={cmp_.ang_deg:.2f}°  ray⊥={cmp_.miss_ray_mm:.1f}mm"
-                if cmp_.ang_deg is not None and cmp_.miss_ray_mm is not None
-                else ""
+        parts = [f"Debug click truth=({truth[0]:.0f},{truth[1]:.0f})"]
+        if cmp_.pred_uv is not None:
+            parts.append(
+                f"3D=({cmp_.pred_uv[0]:.0f},{cmp_.pred_uv[1]:.0f}) "
+                f"Δ=({cmp_.du_px:+.0f},{cmp_.dv_px:+.0f})px "
+                f"|err|={cmp_.err_px:.0f}px/{cmp_.err_mm:.1f}mm"
             )
-        )
+        if pred_2d is not None:
+            du2 = float(pred_2d[0] - truth[0])
+            dv2 = float(pred_2d[1] - truth[1])
+            err2 = float(np.hypot(du2, dv2))
+            sx = float(width_mm) / max(float(screen_w), 1.0)
+            sy = float(height_mm) / max(float(screen_h), 1.0)
+            err2_mm = float(np.hypot(du2 * sx, dv2 * sy))
+            parts.append(
+                f"2D=({pred_2d[0]:.0f},{pred_2d[1]:.0f}) "
+                f"Δ=({du2:+.0f},{dv2:+.0f})px "
+                f"|err|={err2:.0f}px/{err2_mm:.1f}mm"
+            )
+        if cmp_.ang_deg is not None and cmp_.miss_ray_mm is not None:
+            parts.append(f"ang={cmp_.ang_deg:.2f}° ray⊥={cmp_.miss_ray_mm:.1f}mm")
+        print("  ".join(parts))
+
         # Summarize axis bias across all persisted clicks (helps spot Y-only error).
         with_pred = [c for c in debug_compares_all if c.du_px is not None]
         if len(with_pred) >= 2:
@@ -720,7 +835,10 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
         if auto_heatmap:
-            print("Press H for heatmap mode (ray ∩ live ArUco).")
+            print(
+                "Press H for heatmap mode "
+                "(green=3D MultiCam, red=2D FrontPixelGaze)."
+            )
             mode = "heatmap"
             heatmap_on = True
         return True
@@ -746,7 +864,13 @@ def main(argv: list[str] | None = None) -> int:
         f"P_front Z range<={max_pfront_z_range_mm:.0f}mm"
     )
     print(f"  Pupil confidence gate: >={min_pupil_confidence:.2f} (look-at frames only)")
-    print("  Heatmap: ray ∩ live ArUco plane only (no 2D UV map).")
+    if front_uv_map is not None:
+        print(
+            "  Heatmap: green=3D MultiCam ray∩plane; "
+            "red=2D FrontPixelGaze yaw/pitch→UV."
+        )
+    else:
+        print("  Heatmap: green=3D MultiCam ray∩plane (no FrontPixelGaze map loaded).")
     if skip_grid:
         print("  Mode: heatmap-only (loaded device calibration; no look-at grid).")
         print("  Look around until IR is ready; right-click to debug; Q to quit.")
@@ -758,8 +882,8 @@ def main(argv: list[str] | None = None) -> int:
             "need >=3 kept points to solve."
         )
     print(
-        "  Heatmap right-click: look there, click = ground truth vs green gaze "
-        "(Δu/Δv px + mm; C clears debug marks)."
+        "  Heatmap right-click: GT vs green 3D (+ red 2D if loaded); "
+        "C clears debug marks."
     )
     if flip_v or flip_h:
         print(
@@ -834,6 +958,15 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
             if mode == "warmup" and readiness.ready:
+                # Freeze validated IR center so it cannot drift during look-ats.
+                frozen = eye.freeze_sphere_center("left")
+                if frozen is not None:
+                    set_eye_center_ir_px(setup, "left", frozen)
+                    save_camera_setup(setup_path, setup)
+                    print(
+                        f"[left] Locked eye_center_ir_px={list(frozen)} "
+                        f"for calib (saved {setup_path.name})."
+                    )
                 mode = "heatmap" if skip_grid else "calib"
                 print(
                     f"Eyeball ready: radius≈{readiness.radius_px:.0f}px, "
@@ -908,6 +1041,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
             live_debug["pred_uv"] = None
+            live_debug["pred_uv_2d"] = None
             live_debug["ray_origin"] = None
             live_debug["ray_dir"] = None
             live_debug["pose_est"] = pose_est
@@ -948,6 +1082,40 @@ def main(argv: list[str] | None = None) -> int:
                                 cv2.circle(
                                     canvas, (int(pu), int(pv)), 10, (0, 255, 0), 2
                                 )
+                    # FrontPixelGaze 2D: raw eye dir → front UV → ArUco H → screen.
+                    if (
+                        front_uv_map is not None
+                        and ok_f
+                        and front is not None
+                        and pose_est.front_to_screen_h is not None
+                        and pose_est.front_quad_corners is not None
+                    ):
+                        fh, fw = front.shape[:2]
+                        front_uv = front_uv_map.apply(
+                            gaze.direction, image_size=(fw, fh)
+                        )
+                        screen_uv = front_uv_to_screen(
+                            front_uv,
+                            pose_est.front_to_screen_h,
+                            pose_est.front_quad_corners,
+                        )
+                        if screen_uv is not None:
+                            su, sv = screen_uv
+                            live_debug["pred_uv_2d"] = (su, sv)
+                            if 0.0 <= su < screen_w and 0.0 <= sv < screen_h:
+                                cv2.drawMarker(
+                                    canvas,
+                                    (int(round(su)), int(round(sv))),
+                                    (0, 0, 255),
+                                    markerType=cv2.MARKER_TILTED_CROSS,
+                                    markerSize=18,
+                                    thickness=2,
+                                )
+                _draw_ab_legend(
+                    canvas,
+                    clear=clear,
+                    has_frontpixel=front_uv_map is not None,
+                )
                 if debug_compares:
                     _draw_debug_compares(canvas, debug_compares)
                     status_lines.append(

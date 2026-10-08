@@ -1387,6 +1387,29 @@ def lock_sphere_center_at_pupil(eye_id, min_confidence=None):
     return locked
 
 
+def freeze_sphere_center(eye_id):
+    """Freeze the current adapted 2D eyeball center (do not snap to pupil).
+
+    Use after warmup has validated the sphere: stops auto center drift for
+    look-at calib / heatmap. If already locked, returns the existing lock.
+    """
+    global locked_model_center_avg, prev_model_center_avg
+
+    if eye_id not in EYE_IDS:
+        return None
+    load_eye_tracking_state(eye_id)
+    if sphere_center_locked_2d:
+        xy = locked_model_center_avg
+        return int(xy[0]), int(xy[1])
+    xy = locked_model_center_avg or prev_model_center_avg
+    if xy is None:
+        print(f"[{eye_id}] Freeze failed: no eye-center estimate yet.")
+        return None
+    locked = apply_locked_eye_center_ir_px(eye_id, xy)
+    print(f"[{eye_id}] Eye center frozen at {locked} (post-warmup).")
+    return locked
+
+
 def unlock_sphere_center(eye_id):
     """Resume auto-updating the 2D eyeball center estimate."""
     global sphere_center_locked_2d, calibrated_sphere_center
